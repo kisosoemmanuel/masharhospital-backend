@@ -1,7 +1,7 @@
 # main.py
-from queue_manager import QueueManager          # Dev 1
-from patient_service import register_patient    # Dev 2
-from report_manager import ReportManager        # Yours
+from queue_manager import QueueManager     
+from patient_service import register_patient
+from report_manager import ReportManager
 
 
 def display_menu():
@@ -14,18 +14,16 @@ def display_menu():
 
 
 def main():
-    qm = QueueManager()          # Dev 1 class
-    total_served_session = 0    # Your system state tracking
+    qm = QueueManager()
+    total_served_session = 0
 
     while True:
         display_menu()
         choice = input("Select an option: ")
 
         if choice == "1":
-            # Dev 2 handles registration
             patient = register_patient()
 
-            # Dev 1 handles queueing
             qm.enqueue(patient)
             print("Patient successfully added to queue.")
 
