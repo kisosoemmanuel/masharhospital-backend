@@ -211,3 +211,73 @@ consultations_db = {
 
 prescriptions_db = {}
 next_prescription_id = 1
+
+class NotificationType(str, Enum):
+    SUCCESS = "success"
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+
+class Notification(BaseModel):
+    id: int
+    user_id: Optional[int]  # Can be None for system notifications
+    user_name: Optional[str]
+    message: str
+    type: NotificationType
+    timestamp: datetime
+    read: bool = False
+    role_target: Optional[str]  # 'receptionist', 'doctor', 'admin', 'all'
+
+class QuickRegistration(BaseModel):
+    patient_name: str
+    phone: str
+    condition: str
+    priority: int  # 1=Normal, 2=Urgent, 3=Emergency
+    department: str = "General"
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "patient_name": "John Doe",
+                "phone": "0712345678",
+                "condition": "Headache",
+                "priority": 1,
+                "department": "General"
+            }
+        }
+
+# Add notifications database
+notifications_db = [
+    {
+        "id": 1,
+        "user_id": 1,
+        "user_name": "Dr. John Kamau",
+        "message": "Patient Mary Wanjiru marked as treated",
+        "type": "success",
+        "timestamp": datetime.now() - timedelta(minutes=2),
+        "read": False,
+        "role_target": "all"
+    },
+    {
+        "id": 2,
+        "user_id": None,
+        "user_name": "System",
+        "message": "New emergency case added to queue",
+        "type": "info",
+        "timestamp": datetime.now() - timedelta(minutes=10),
+        "read": False,
+        "role_target": "receptionist"
+    },
+    {
+        "id": 3,
+        "user_id": 5,
+        "user_name": "Receptionist Jane",
+        "message": "New patient registered at front desk",
+        "type": "info",
+        "timestamp": datetime.now() - timedelta(minutes=30),
+        "read": False,
+        "role_target": "all"
+    }
+]
+
+next_notification_id = max([n["id"] for n in notifications_db]) + 1 if notifications_db else 1
