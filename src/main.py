@@ -3,287 +3,432 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from contextlib import asynccontextmanager
 from typing import Optional, List
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
 from dotenv import load_dotenv
 from jose import JWTError, jwt
 
-from src.models.doctor import DoctorModel, DoctorCreate, DoctorLogin
-from src.models.patients import Patient, PatientCreate, PatientUpdate
+# Models
+from src.models.doctor import DoctorModel, DoctorLogin
+from src.models.patients import PatientCreate, PatientUpdate, QuickRegistration, NotificationType
+from src.models.admin import StaffCreate, StaffUpdate, StaffRole, StaffStatus
+from src.models.receptionist import ReceptionistCreate, ReceptionistUpdate
+
+# Services
 from src.services.patient_service import PatientService
 from src.services.queue_manager import QueueManager
-from src.models.admin import StaffCreate, StaffUpdate, StaffRole
 from src.services.admin_service import AdminService
-from src.models.patients import QuickRegistration, PatientCreate, NotificationType
 from src.services.receptionist_service import ReceptionistService
 
 load_dotenv()
 
+SECRET_KEY = os.getenv("SECRET_KEY", "secret-key")
+ALGORITHM = "HS256"
+
+
+# --------------------------------------------------
+# APPLICATION LIFESPAN
+# --------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     print("Starting up...")
     QueueManager.initialize()
     yield
-    # Shutdown
     print("Shutting down...")
+
 
 app = FastAPI(
     title="Mashar Hospital Queue Management System",
     description="Backend API for hospital queue management",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan
 )
 
-# CORS middleware configuration
+
+# --------------------------------------------------
+# CORS
+# --------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Your frontend URL
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
 
-# Helper function to get current user
+# --------------------------------------------------
+# AUTHENTICATION
+# --------------------------------------------------
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/doctors/login", auto_error=False)
+
+
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     if not token:
-        return None
-    
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
     try:
-        payload = jwt.decode(token, os.getenv("SECRET_KEY", "your-secret-key"), algorithms=["HS256"])
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        if not username:
+            raise HTTPException(status_code=401, detail="Invalid token")
     except JWTError:
-        raise credentials_exception
-    
+        raise HTTPException(status_code=401, detail="Token error")
     user = DoctorModel.get_by_username(username)
-    if user is None:
-        raise credentials_exception
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
     return user
 
-# Optional auth dependency
+
 async def get_optional_user(token: str = Depends(oauth2_scheme)):
     if not token:
         return None
     try:
-        payload = jwt.decode(token, os.getenv("SECRET_KEY", "your-secret-key"), algorithms=["HS256"])
-        username: str = payload.get("sub")
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
         if username:
             return DoctorModel.get_by_username(username)
     except JWTError:
-        pass
+        return None
     return None
 
-# Doctor routes
+
+# --------------------------------------------------
+# ROOT & HEALTH CHECK
+# --------------------------------------------------
+@app.get("/")
+async def root():
+    return {
+        "message": "Mashar Hospital API is running",
+        "docs": "http://localhost:8000/docs",
+        "health": "http://localhost:8000/api/health"
+    }
+
+
+@app.get("/api/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+
+# --------------------------------------------------
+# DOCTOR ROUTES
+# --------------------------------------------------
 @app.post("/api/doctors/login")
 async def doctor_login(login_data: DoctorLogin):
-    """Doctor login endpoint"""
     result = DoctorModel.authenticate(login_data.username, login_data.password, login_data.role)
     if not result:
         raise HTTPException(status_code=401, detail="Invalid credentials")
     return result
 
+
 @app.get("/api/doctors/current")
 async def get_current_doctor(current_user: dict = Depends(get_current_user)):
-    """Get currently logged in doctor"""
     return current_user
 
-# Patient routes
+
+@app.get("/api/doctors")
+async def get_doctors():
+    doctors = DoctorModel.get_all_doctors()
+    return doctors or {"message": "No doctors found"}
+
+
+@app.get("/api/doctors/{doctor_id}")
+async def get_doctor_by_id(doctor_id: int):
+    doctor = DoctorModel.get_doctor_by_id(doctor_id)
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor not found")
+    return doctor
+
+
+# --------------------------------------------------
+# PATIENT ROUTES
+# --------------------------------------------------
 @app.get("/api/patients")
-async def get_patients(
-    search: Optional[str] = None,
-    status: Optional[str] = None,
-    current_user: dict = Depends(get_optional_user)
-):
-    """Get all patients with optional filters"""
+async def get_patients(search: Optional[str] = None, status: Optional[str] = None, current_user: dict = Depends(get_optional_user)):
     return PatientService.get_patients(search, status)
 
+
 @app.get("/api/patients/{patient_id}")
-async def get_patient(
-    patient_id: int,
-    current_user: dict = Depends(get_optional_user)
-):
-    """Get patient by ID"""
+async def get_patient(patient_id: int):
     patient = PatientService.get_patient_by_id(patient_id)
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found")
     return patient
 
+
 @app.post("/api/patients")
-async def create_patient(
-    patient: PatientCreate,
-    current_user: dict = Depends(get_optional_user)
-):
-    """Create a new patient"""
+async def create_patient(patient: PatientCreate):
     return PatientService.create_patient(patient)
 
+
 @app.put("/api/patients/{patient_id}")
-async def update_patient(
-    patient_id: int,
-    patient_update: PatientUpdate,
-    current_user: dict = Depends(get_optional_user)
-):
-    """Update patient information"""
+async def update_patient(patient_id: int, patient_update: PatientUpdate):
     result = PatientService.update_patient(patient_id, patient_update)
     if not result:
         raise HTTPException(status_code=404, detail="Patient not found")
     return result
 
+
 @app.delete("/api/patients/{patient_id}")
-async def delete_patient(
-    patient_id: int,
-    current_user: dict = Depends(get_current_user)
-):
-    """Delete a patient (admin only)"""
-    if not current_user or current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
+async def delete_patient(patient_id: int, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
     result = PatientService.delete_patient(patient_id)
     if not result:
         raise HTTPException(status_code=404, detail="Patient not found")
     return {"message": "Patient deleted successfully"}
 
-# Queue management routes
+
+# --------------------------------------------------
+# QUEUE ROUTES
+# --------------------------------------------------
 @app.get("/api/queue/current")
-async def get_current_consultation(
-    doctor_id: Optional[int] = None,
-    department: Optional[str] = None
-):
-    """Get current consultation"""
+async def get_current_consultation(doctor_id: Optional[int] = None, department: Optional[str] = None):
     return QueueManager.get_current_consultation(doctor_id, department)
 
+
 @app.get("/api/queue/waiting")
-async def get_waiting_patients(
-    doctor_id: Optional[int] = None,
-    department: Optional[str] = "Cardiology"
-):
-    """Get waiting patients"""
+async def get_waiting_patients(doctor_id: Optional[int] = None, department: Optional[str] = "Cardiology"):
     return QueueManager.get_waiting_patients(doctor_id, department)
 
-@app.post("/api/queue/start/{consultation_id}")
-async def start_consultation(
-    consultation_id: int,
-    doctor_id: int,
-    current_user: dict = Depends(get_optional_user)
-):
-    """Start a consultation"""
-    result = QueueManager.start_consultation(consultation_id, doctor_id)
-    if not result:
-        raise HTTPException(status_code=400, detail="Cannot start consultation")
-    return result
-
-@app.post("/api/queue/complete/{consultation_id}")
-async def complete_consultation(
-    consultation_id: int,
-    medication: str,
-    instructions: Optional[str] = None,
-    dosage: Optional[str] = None,
-    doctor_id: int = None,
-    current_user: dict = Depends(get_optional_user)
-):
-    """Complete a consultation with prescription"""
-    if not doctor_id and current_user:
-        doctor_id = current_user.get("id")
-    
-    if not doctor_id:
-        raise HTTPException(status_code=400, detail="Doctor ID required")
-    
-    result = QueueManager.complete_consultation(
-        consultation_id, doctor_id, medication, instructions, dosage
-    )
-    if not result:
-        raise HTTPException(status_code=400, detail="Cannot complete consultation")
-    return result
 
 @app.post("/api/queue/register")
-async def register_patient_queue(
-    patient_id: int,
-    department: str = "Cardiology",
-    condition: str = None,
-    priority: int = 1,
-    doctor_id: int = 1,
-    current_user: dict = Depends(get_optional_user)
-):
-    """Register patient to queue"""
+async def register_patient_queue(patient_id: int, department: str = "Cardiology", condition: Optional[str] = None, priority: int = 1, doctor_id: int = 1):
     try:
-        result = QueueManager.add_to_queue(patient_id, department, condition, priority, doctor_id)
-        return result
+        return QueueManager.add_to_queue(patient_id, department, condition, priority, doctor_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+
 @app.get("/api/queue/status")
 async def get_queue_status():
-    """Get queue statistics"""
     return QueueManager.get_queue_stats()
 
-# Prescription routes
+
+# --------------------------------------------------
+# PRESCRIPTIONS
+# --------------------------------------------------
 @app.get("/api/prescriptions")
-async def get_prescriptions(
-    search: Optional[str] = None,
-    patient_id: Optional[int] = None,
-    current_user: dict = Depends(get_optional_user)
-):
-    """Get prescriptions with filters"""
+async def get_prescriptions(search: Optional[str] = None, patient_id: Optional[int] = None):
     return PatientService.get_prescriptions(search, patient_id)
 
+
 @app.post("/api/prescriptions")
-async def create_prescription(
-    patient_id: int,
-    medication: str,
-    instructions: Optional[str] = None,
-    dosage: Optional[str] = None,
-    duration: Optional[str] = None,
-    doctor_id: int = None,
-    consultation_id: Optional[int] = None,
-    current_user: dict = Depends(get_optional_user)
-):
-    """Create a new prescription"""
-    if not doctor_id and current_user:
-        doctor_id = current_user.get("id")
-    
+async def create_prescription(patient_id: int, medication: str, instructions: Optional[str] = None, dosage: Optional[str] = None, duration: Optional[str] = None, doctor_id: Optional[int] = None):
     if not doctor_id:
         raise HTTPException(status_code=400, detail="Doctor ID required")
-    
-    return PatientService.create_prescription(
-        patient_id, doctor_id, medication, instructions, dosage, duration, consultation_id
-    )
+    return PatientService.create_prescription(patient_id, doctor_id, medication, instructions, dosage, duration)
 
+
+# --------------------------------------------------
+# RECEPTIONIST ROUTES (Original)
+# --------------------------------------------------
+@app.get("/api/receptionist/dashboard")
+async def get_receptionist_dashboard(current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") not in ["receptionist", "admin"]:
+        raise HTTPException(status_code=403, detail="Receptionist access required")
+    return ReceptionistService.get_dashboard_stats()
+
+
+@app.post("/api/receptionist/patients/quick")
+async def quick_register_patient(registration: QuickRegistration, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") not in ["receptionist", "admin"]:
+        raise HTTPException(status_code=403, detail="Receptionist access required")
+    
+    # Add receptionist name to registration
+    registration.receptionist_name = current_user.get("name", "Receptionist")
+    return ReceptionistService.quick_register_patient(registration, current_user.get("id", 0))
+
+
+@app.get("/api/receptionist/queue")
+async def get_receptionist_queue(department: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") not in ["receptionist", "admin", "doctor"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return ReceptionistService.get_patients_in_queue(department)
+
+
+# --------------------------------------------------
+# NEW RECEPTIONIST ROUTES (Added)
+# --------------------------------------------------
+
+@app.get("/api/receptionists")
+async def get_all_receptionists(current_user: dict = Depends(get_current_user)):
+    """Get all receptionists (Active and Inactive)"""
+    if current_user.get("role") not in ["receptionist", "admin"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return ReceptionistService.get_all_receptionists()
+
+
+@app.get("/api/receptionists/active")
+async def get_active_receptionists(current_user: dict = Depends(get_current_user)):
+    """Get only active receptionists"""
+    if current_user.get("role") not in ["receptionist", "admin"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return ReceptionistService.get_active_receptionists()
+
+
+@app.get("/api/receptionists/{receptionist_id}")
+async def get_receptionist_by_id(receptionist_id: int, current_user: dict = Depends(get_current_user)):
+    """Get receptionist by ID"""
+    if current_user.get("role") not in ["receptionist", "admin"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    receptionist = ReceptionistService.get_receptionist_by_id(receptionist_id)
+    if not receptionist:
+        raise HTTPException(status_code=404, detail="Receptionist not found")
+    return receptionist
+
+
+@app.get("/api/receptionists/employee/{employee_id}")
+async def get_receptionist_by_employee_id(employee_id: str, current_user: dict = Depends(get_current_user)):
+    """Get receptionist by employee ID"""
+    if current_user.get("role") not in ["receptionist", "admin"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    receptionist = ReceptionistService.get_receptionist_by_employee_id(employee_id)
+    if not receptionist:
+        raise HTTPException(status_code=404, detail="Receptionist not found")
+    return receptionist
+
+
+@app.post("/api/receptionists")
+async def create_receptionist(receptionist_data: ReceptionistCreate, current_user: dict = Depends(get_current_user)):
+    """Create a new receptionist (Admin only)"""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    result = ReceptionistService.create_receptionist(receptionist_data)
+    if not result.get("success", True):
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed to create receptionist"))
+    
+    return result
+
+
+@app.put("/api/receptionists/{receptionist_id}")
+async def update_receptionist(receptionist_id: int, receptionist_update: ReceptionistUpdate, current_user: dict = Depends(get_current_user)):
+    """Update receptionist information (Admin only)"""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    result = ReceptionistService.update_receptionist(receptionist_id, receptionist_update)
+    if not result:
+        raise HTTPException(status_code=404, detail="Receptionist not found")
+    
+    return result
+
+
+@app.delete("/api/receptionists/{receptionist_id}")
+async def delete_receptionist(receptionist_id: int, current_user: dict = Depends(get_current_user)):
+    """Delete/Deactivate receptionist (Admin only)"""
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    result = ReceptionistService.delete_receptionist(receptionist_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Receptionist not found")
+    
+    return {"message": "Receptionist deleted successfully"}
+
+
+# --------------------------------------------------
+# QUEUE MANAGEMENT (Enhanced)
+# --------------------------------------------------
+
+@app.get("/api/queue/priority")
+async def get_queue_by_priority(department: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+    """Get queue organized by priority"""
+    if current_user.get("role") not in ["receptionist", "admin", "doctor"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    return ReceptionistService.get_queue_by_priority(department)
+
+
+@app.post("/api/queue/next/{doctor_id}")
+async def call_next_patient(doctor_id: int, current_user: dict = Depends(get_current_user)):
+    """Call the next patient for a doctor"""
+    if current_user.get("role") not in ["receptionist", "admin", "doctor"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    result = ReceptionistService.call_next_patient(doctor_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="No patients in queue")
+    
+    return result
+
+
+# --------------------------------------------------
+# PATIENT SEARCH
+# --------------------------------------------------
+
+@app.get("/api/patients/search/{query}")
+async def search_patients(query: str, current_user: dict = Depends(get_current_user)):
+    """Search patients by name or phone"""
+    if current_user.get("role") not in ["receptionist", "admin", "doctor"]:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    return ReceptionistService.search_patients(query)
+
+
+# --------------------------------------------------
+# NOTIFICATION ROUTES
+# --------------------------------------------------
+
+@app.get("/api/notifications")
+async def get_notifications(limit: int = 50, current_user: dict = Depends(get_current_user)):
+    """Get notifications for current user's role"""
+    role = current_user.get("role", "receptionist")
+    return ReceptionistService.get_notifications(role, limit)
+
+
+@app.get("/api/notifications/unread/count")
+async def get_unread_count(current_user: dict = Depends(get_current_user)):
+    """Get count of unread notifications"""
+    role = current_user.get("role", "receptionist")
+    return {"unread_count": ReceptionistService.get_unread_count(role)}
+
+
+@app.put("/api/notifications/{notification_id}/read")
+async def mark_notification_read(notification_id: int, current_user: dict = Depends(get_current_user)):
+    """Mark a notification as read"""
+    result = ReceptionistService.mark_notification_read(notification_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    return {"message": "Notification marked as read"}
+
+
+@app.put("/api/notifications/read-all")
+async def mark_all_notifications_read(current_user: dict = Depends(get_current_user)):
+    """Mark all notifications as read for current user's role"""
+    role = current_user.get("role", "receptionist")
+    count = ReceptionistService.mark_all_notifications_read(role)
+    return {"message": f"{count} notifications marked as read"}
+
+
+# --------------------------------------------------
+# ADMIN ROUTES
+# --------------------------------------------------
 @app.get("/api/admin/dashboard")
-async def get_admin_dashboard(current_user: dict = Depends(get_current_user)):
-    """Get admin dashboard statistics"""
-    if not current_user or current_user.get("role") != "admin":
+async def admin_dashboard(current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     
     return AdminService.get_dashboard_stats()
 
-# Staff Management
+
 @app.get("/api/admin/staff")
-async def get_all_staff(
-    role: Optional[str] = None,
-    department: Optional[str] = None,
-    current_user: dict = Depends(get_current_user)
-):
-    """Get all staff members"""
-    if not current_user or current_user.get("role") != "admin":
+async def get_all_staff(role: Optional[str] = None, department: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     
-    return AdminService.get_all_staff(role, department)
+    staff = AdminService.get_all_staff(role, department)
+    return staff or {"message": "No staff found"}
+
 
 @app.get("/api/admin/staff/{staff_id}")
-async def get_staff(
-    staff_id: int,
-    current_user: dict = Depends(get_current_user)
-):
-    """Get staff member by ID"""
-    if not current_user or current_user.get("role") != "admin":
+async def get_staff_by_id(staff_id: int, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     
     staff = AdminService.get_staff_by_id(staff_id)
@@ -291,495 +436,369 @@ async def get_staff(
         raise HTTPException(status_code=404, detail="Staff not found")
     return staff
 
+
+@app.get("/api/admin/staff/employee/{staff_id_str}")
+async def get_staff_by_staff_id(staff_id_str: str, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    staff = AdminService.get_staff_by_staff_id(staff_id_str)
+    if not staff:
+        raise HTTPException(status_code=404, detail="Staff not found")
+    return staff
+
+
 @app.post("/api/admin/staff")
-async def create_staff(
-    staff_data: StaffCreate,
-    current_user: dict = Depends(get_current_user)
-):
-    """Create a new staff member"""
-    if not current_user or current_user.get("role") != "admin":
+async def create_staff(staff_data: StaffCreate, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     
     try:
-        return AdminService.create_staff(staff_data)
+        result = AdminService.create_staff(staff_data)
+        return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+
 @app.put("/api/admin/staff/{staff_id}")
-async def update_staff(
-    staff_id: int,
-    staff_update: StaffUpdate,
-    current_user: dict = Depends(get_current_user)
-):
-    """Update staff information"""
-    if not current_user or current_user.get("role") != "admin":
+async def update_staff(staff_id: int, staff_update: StaffUpdate, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     
     result = AdminService.update_staff(staff_id, staff_update)
     if not result:
         raise HTTPException(status_code=404, detail="Staff not found")
+    
     return result
 
+
 @app.delete("/api/admin/staff/{staff_id}")
-async def delete_staff(
-    staff_id: int,
-    current_user: dict = Depends(get_current_user)
-):
-    """Delete/deactivate a staff member"""
-    if not current_user or current_user.get("role") != "admin":
+async def delete_staff(staff_id: int, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
+    
+    # Get staff details before deletion for logging
+    staff = AdminService.get_staff_by_id(staff_id)
+    if not staff:
+        raise HTTPException(status_code=404, detail="Staff not found")
     
     result = AdminService.delete_staff(staff_id)
     if not result:
-        raise HTTPException(status_code=404, detail="Staff not found")
-    return {"message": "Staff member deactivated successfully"}
-
-# Bed Management
-@app.get("/api/admin/beds")
-async def get_bed_status(current_user: dict = Depends(get_current_user)):
-    """Get bed occupancy status"""
-    if not current_user or current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+        raise HTTPException(status_code=400, detail="Failed to delete staff")
     
-    return AdminService.get_bed_status()
+    return {"message": "Staff deleted successfully"}
 
-@app.post("/api/admin/beds/{bed_id}/assign/{patient_id}")
-async def assign_bed(
-    bed_id: int,
-    patient_id: int,
-    current_user: dict = Depends(get_current_user)
-):
-    """Assign a bed to a patient"""
-    if not current_user or current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    
-    result = AdminService.assign_bed(bed_id, patient_id)
-    if not result:
-        raise HTTPException(status_code=400, detail="Cannot assign bed")
-    return result
 
-@app.post("/api/admin/beds/{bed_id}/release")
-async def release_bed(
-    bed_id: int,
-    current_user: dict = Depends(get_current_user)
-):
-    """Release a bed"""
-    if not current_user or current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    
-    result = AdminService.release_bed(bed_id)
-    if not result:
-        raise HTTPException(status_code=400, detail="Cannot release bed")
-    return result
-
-# Inventory Management
-@app.get("/api/admin/inventory")
-async def get_inventory_status(current_user: dict = Depends(get_current_user)):
-    """Get inventory status"""
-    if not current_user or current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    
-    return AdminService.get_inventory_status()
-
-@app.put("/api/admin/inventory/{item_id}")
-async def update_inventory(
-    item_id: int,
-    quantity_change: int,
-    current_user: dict = Depends(get_current_user)
-):
-    """Update inventory quantity"""
-    if not current_user or current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    
-    result = AdminService.update_inventory(item_id, quantity_change)
-    if not result:
-        raise HTTPException(status_code=404, detail="Item not found")
-    return result
-
-# Activity Log
-@app.get("/api/admin/activity")
-async def get_recent_activity(
-    limit: int = 10,
-    current_user: dict = Depends(get_current_user)
-):
-    """Get recent activity logs"""
-    if not current_user or current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    
-    return AdminService.get_recent_activity(limit)
-
-# Records
-@app.get("/api/admin/records")
-async def get_all_records(current_user: dict = Depends(get_current_user)):
-    """Get all hospital records"""
-    if not current_user or current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    
-    return AdminService.get_all_records()
-
-# Reports
-@app.post("/api/admin/reports/monthly")
-async def generate_monthly_report(current_user: dict = Depends(get_current_user)):
-    """Generate monthly report"""
-    if not current_user or current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
-    
-    return AdminService.generate_monthly_report()
-
-# Staff Statistics
 @app.get("/api/admin/staff/statistics")
 async def get_staff_statistics(current_user: dict = Depends(get_current_user)):
-    """Get staff statistics"""
-    if not current_user or current_user.get("role") != "admin":
+    if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     
     return AdminService.get_staff_statistics()
 
-# Statistics routes
-@app.get("/api/statistics/weekly")
-async def get_weekly_statistics(current_user: dict = Depends(get_optional_user)):
-    """Get weekly statistics"""
-    return PatientService.get_weekly_statistics()
 
-@app.get("/api/statistics/doctor/{doctor_id}")
-async def get_doctor_statistics(
-    doctor_id: int,
-    current_user: dict = Depends(get_optional_user)
-):
-    """Get statistics for specific doctor"""
-    return PatientService.get_doctor_statistics(doctor_id)
-
-
-
-# Health check
-@app.get("/api/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
-
-@app.get("/api/receptionist/dashboard")
-async def get_receptionist_dashboard(current_user: dict = Depends(get_current_user)):
-    """Get receptionist dashboard statistics"""
-    if not current_user or current_user.get("role") not in ["receptionist", "admin"]:
-        raise HTTPException(status_code=403, detail="Receptionist access required")
+@app.get("/api/admin/beds")
+async def get_beds(current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
     
-    return ReceptionistService.get_dashboard_stats()
+    return AdminService.get_bed_status()
 
-# Patient Registration
-@app.post("/api/receptionist/patients/quick")
-async def quick_register_patient(
-    registration: QuickRegistration,
-    current_user: dict = Depends(get_current_user)
-):
-    """Quick register a patient and add to queue"""
-    if not current_user or current_user.get("role") not in ["receptionist", "admin"]:
-        raise HTTPException(status_code=403, detail="Receptionist access required")
-    
-    return ReceptionistService.quick_register_patient(registration, current_user.get("id", 0))
 
-@app.post("/api/receptionist/patients")
-async def register_patient(
-    patient_data: PatientCreate,
-    current_user: dict = Depends(get_current_user)
-):
-    """Register a new patient (full registration)"""
-    if not current_user or current_user.get("role") not in ["receptionist", "admin"]:
-        raise HTTPException(status_code=403, detail="Receptionist access required")
+@app.post("/api/admin/beds/{bed_id}/assign")
+async def assign_bed(bed_id: int, patient_id: int, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
     
-    return ReceptionistService.register_patient(patient_data, current_user.get("id", 0))
-
-# Queue Management
-@app.get("/api/receptionist/queue")
-async def get_queue(
-    department: Optional[str] = None,
-    current_user: dict = Depends(get_current_user)
-):
-    """Get full queue list"""
-    if not current_user or current_user.get("role") not in ["receptionist", "admin", "doctor"]:
-        raise HTTPException(status_code=403, detail="Access required")
-    
-    return ReceptionistService.get_patients_in_queue()
-
-@app.put("/api/receptionist/queue/{consultation_id}/priority")
-async def update_queue_priority(
-    consultation_id: int,
-    priority: int,
-    current_user: dict = Depends(get_current_user)
-):
-    """Update patient priority in queue"""
-    if not current_user or current_user.get("role") not in ["receptionist", "admin"]:
-        raise HTTPException(status_code=403, detail="Receptionist access required")
-    
-    result = ReceptionistService.update_queue_priority(consultation_id, priority)
+    result = AdminService.assign_bed(bed_id, patient_id)
     if not result:
-        raise HTTPException(status_code=404, detail="Consultation not found or not in queue")
+        raise HTTPException(status_code=400, detail="Bed not available or invalid")
+    
     return result
 
-@app.delete("/api/receptionist/queue/{consultation_id}")
-async def remove_from_queue(
-    consultation_id: int,
-    current_user: dict = Depends(get_current_user)
-):
-    """Remove patient from queue"""
-    if not current_user or current_user.get("role") not in ["receptionist", "admin"]:
-        raise HTTPException(status_code=403, detail="Receptionist access required")
+
+@app.post("/api/admin/beds/{bed_id}/release")
+async def release_bed(bed_id: int, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
     
-    result = ReceptionistService.remove_from_queue(consultation_id)
+    result = AdminService.release_bed(bed_id)
     if not result:
-        raise HTTPException(status_code=404, detail="Consultation not found or not in queue")
-    return {"message": "Patient removed from queue"}
-
-# Patient Search
-@app.get("/api/receptionist/patients/search")
-async def search_patients(
-    q: str,
-    current_user: dict = Depends(get_current_user)
-):
-    """Search patients by name or phone"""
-    if not current_user or current_user.get("role") not in ["receptionist", "admin", "doctor"]:
-        raise HTTPException(status_code=403, detail="Access required")
+        raise HTTPException(status_code=400, detail="Bed not found or already empty")
     
-    return ReceptionistService.search_patients(q)
+    return result
 
-# Recent Patients
-@app.get("/api/receptionist/patients/recent")
-async def get_recent_patients(
-    limit: int = 10,
-    current_user: dict = Depends(get_current_user)
-):
-    """Get recently registered patients"""
-    if not current_user or current_user.get("role") not in ["receptionist", "admin", "doctor"]:
-        raise HTTPException(status_code=403, detail="Access required")
-    
-    return ReceptionistService.get_recent_patients(limit)
 
-# Notifications
-@app.get("/api/receptionist/notifications")
-async def get_notifications(
-    limit: int = 20,
-    current_user: dict = Depends(get_current_user)
-):
-    """Get notifications for receptionist"""
-    if not current_user or current_user.get("role") not in ["receptionist", "admin", "doctor"]:
-        raise HTTPException(status_code=403, detail="Access required")
+@app.get("/api/admin/inventory")
+async def get_inventory(current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
     
-    return ReceptionistService.get_notifications(current_user.get("role", "receptionist"), limit)
+    return AdminService.get_inventory_status()
 
-@app.get("/api/receptionist/notifications/unread")
-async def get_unread_count(current_user: dict = Depends(get_current_user)):
-    """Get unread notifications count"""
-    if not current_user or current_user.get("role") not in ["receptionist", "admin", "doctor"]:
-        raise HTTPException(status_code=403, detail="Access required")
-    
-    return {"unread_count": ReceptionistService.get_unread_count(current_user.get("role", "receptionist"))}
 
-@app.put("/api/receptionist/notifications/{notification_id}/read")
-async def mark_notification_read(
-    notification_id: int,
-    current_user: dict = Depends(get_current_user)
-):
-    """Mark a notification as read"""
-    if not current_user or current_user.get("role") not in ["receptionist", "admin", "doctor"]:
-        raise HTTPException(status_code=403, detail="Access required")
+@app.put("/api/admin/inventory/{item_id}")
+async def update_inventory(item_id: int, quantity_change: int, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
     
-    result = ReceptionistService.mark_notification_read(notification_id)
+    result = AdminService.update_inventory(item_id, quantity_change)
     if not result:
-        raise HTTPException(status_code=404, detail="Notification not found")
-    return {"message": "Notification marked as read"}
-
-@app.put("/api/receptionist/notifications/read-all")
-async def mark_all_notifications_read(current_user: dict = Depends(get_current_user)):
-    """Mark all notifications as read"""
-    if not current_user or current_user.get("role") not in ["receptionist", "admin", "doctor"]:
-        raise HTTPException(status_code=403, detail="Access required")
+        raise HTTPException(status_code=404, detail="Inventory item not found")
     
-    count = ReceptionistService.mark_all_notifications_read(current_user.get("role", "receptionist"))
-    return {"message": f"{count} notifications marked as read"}
+    return result
 
-# Quick Stats
-@app.get("/api/receptionist/stats/quick")
-async def get_quick_stats(current_user: dict = Depends(get_current_user)):
-    """Get quick statistics for receptionist"""
-    if not current_user or current_user.get("role") not in ["receptionist", "admin"]:
-        raise HTTPException(status_code=403, detail="Receptionist access required")
+
+@app.get("/api/admin/activity-logs")
+async def get_activity_logs(limit: int = 10, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
     
-    return ReceptionistService.get_quick_stats()
+    return AdminService.get_recent_activity(limit)
 
-# System Notifications (for creating notifications from other services)
-@app.post("/api/notifications")
-async def create_system_notification(
-    message: str,
-    type: str = "info",
-    role_target: str = "all",
-    current_user: dict = Depends(get_current_user)
-):
-    """Create a system notification (can be called by any service)"""
-    if not current_user:
-        raise HTTPException(status_code=403, detail="Authentication required")
+
+@app.get("/api/admin/records")
+async def get_all_records(current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
     
-    return ReceptionistService.create_notification(
-        user_id=current_user.get("id"),
-        user_name=current_user.get("name"),
-        message=message,
-        type=type,
-        role_target=role_target
-    )
+    return AdminService.get_all_records()
 
 
+@app.get("/api/admin/reports/monthly")
+async def generate_monthly_report(current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    return AdminService.generate_monthly_report()
+
+
+# --------------------------------------------------
+# RUN SERVER
+# --------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("src.main:app", host="0.0.0.0", port=8000, reload=True)
 
 
 
 
 
 
-# 📋 COMPLETE API ROUTES LIST
+"""
+====================================================================================================
+MASHAR HOSPITAL API - COMPLETE ROUTES & LOGIN CREDENTIALS
+====================================================================================================
 
-# 
-# Base URL: http://localhost:8000
-# 
-# 🔐 AUTHENTICATION ROUTES
-# ------------------------
-# POST   /api/doctors/login                 - Login with username, password, and role
-# GET    /api/doctors/current                - Get currently logged in user info
-# GET    /api/health                         - Health check endpoint
-# 
-# 👨‍⚕️ DOCTOR ROUTES
-# -----------------
-# GET    /api/doctor/dashboard                - Get doctor's dashboard with current and waiting patients
-# GET    /api/queue/current                   - Get current consultation (optional doctor_id, department)
-# GET    /api/queue/waiting                    - Get waiting patients (optional doctor_id, department)
-# POST   /api/queue/start/{consultation_id}    - Start a consultation
-# POST   /api/queue/complete/{consultation_id} - Complete consultation with prescription
-# GET    /api/statistics/doctor/{doctor_id}    - Get statistics for specific doctor
-# 
-# 🧑‍💼 RECEPTIONIST ROUTES
-# -----------------------
-# GET    /api/receptionist/dashboard                - Get receptionist dashboard statistics
-# POST   /api/receptionist/patients/quick           - Quick register a patient and add to queue
-# POST   /api/receptionist/patients                  - Register a new patient (full registration)
-# GET    /api/receptionist/queue                     - Get full queue list with patient details
-# PUT    /api/receptionist/queue/{id}/priority       - Update patient priority in queue
-# DELETE /api/receptionist/queue/{id}                - Remove patient from queue
-# GET    /api/receptionist/patients/search           - Search patients by name or phone
-# GET    /api/receptionist/patients/recent           - Get recently registered patients
-# GET    /api/receptionist/stats/quick               - Get quick statistics for receptionist
-# GET    /api/receptionist/departments               - Get list of departments
-# GET    /api/receptionist/department/{dept}/queue   - Get queue for specific department
-# 
-# 🔔 NOTIFICATION ROUTES
-# ----------------------
-# GET    /api/receptionist/notifications             - Get notifications for receptionist
-# GET    /api/receptionist/notifications/unread      - Get unread notifications count
-# PUT    /api/receptionist/notifications/{id}/read   - Mark a notification as read
-# PUT    /api/receptionist/notifications/read-all    - Mark all notifications as read
-# POST   /api/notifications                          - Create a system notification
-# 
-# 👤 PATIENT ROUTES
-# -----------------
-# GET    /api/patients                               - Get all patients with optional filters
-# GET    /api/patients/{patient_id}                  - Get patient by ID with consultation history
-# POST   /api/patients                               - Create a new patient
-# PUT    /api/patients/{patient_id}                  - Update patient information
-# DELETE /api/patients/{patient_id}                   - Delete a patient (admin only)
-# GET    /api/patients/{id}/queue-status             - Get queue status for a specific patient
-# 
-# 💊 PRESCRIPTION ROUTES
-# ----------------------
-# GET    /api/prescriptions                          - Get prescriptions with filters
-# POST   /api/prescriptions                          - Create a new prescription
-# 
-# 📊 QUEUE MANAGEMENT ROUTES
-# --------------------------
-# GET    /api/queue/status                           - Get queue statistics
-# GET    /api/queue/history                          - Get historical queue data
-# PUT    /api/queue/reassign/{consultation_id}       - Reassign consultation to another doctor
-# 
-# 📈 STATISTICS ROUTES
-# --------------------
-# GET    /api/statistics/weekly                      - Get weekly statistics
-# GET    /api/statistics/doctor/{doctor_id}          - Get statistics for specific doctor
-# 
-# 👑 ADMIN ROUTES
-# ---------------
-# GET    /api/admin/dashboard                        - Get admin dashboard statistics
-# GET    /api/admin/staff                            - Get all staff members
-# GET    /api/admin/staff/{staff_id}                 - Get staff member by ID
-# POST   /api/admin/staff                            - Create a new staff member
-# PUT    /api/admin/staff/{staff_id}                 - Update staff information
-# DELETE /api/admin/staff/{staff_id}                  - Delete/deactivate a staff member
-# GET    /api/admin/staff/statistics                 - Get staff statistics
-# 
-# 🛏️ BED MANAGEMENT ROUTES (ADMIN)
-# ---------------------------------
-# GET    /api/admin/beds                             - Get bed occupancy status
-# POST   /api/admin/beds/{bed_id}/assign/{patient_id} - Assign a bed to a patient
-# POST   /api/admin/beds/{bed_id}/release            - Release a bed
-# 
-# 📦 INVENTORY ROUTES (ADMIN)
-# ---------------------------
-# GET    /api/admin/inventory                        - Get inventory status
-# PUT    /api/admin/inventory/{item_id}              - Update inventory quantity
-# 
-# 📋 RECORDS ROUTES (ADMIN)
-# -------------------------
-# GET    /api/admin/activity                         - Get recent activity logs
-# GET    /api/admin/records                          - Get all hospital records
-# POST   /api/admin/reports/monthly                  - Generate monthly report
+BASE URL: http://localhost:8000 | DOCS: http://localhost:8000/docs | REDOC: http://localhost:8000/redoc
 
-# 📊 SUMMARY
+----------------------------------------------------------------------------------------------------
+LOGIN CREDENTIALS (Default Users)
+----------------------------------------------------------------------------------------------------
+POST /api/doctors/login
+Content-Type: application/json
 
-# Total Routes: 60+ 
-# - Authentication: 3
-# - Doctor: 7
-# - Receptionist: 13
-# - Notifications: 5
-# - Patient: 6
-# - Prescriptions: 2
-# - Queue Management: 4
-# - Statistics: 2
-# - Admin: 18
-# 
+┌──────────────┬────────────┬─────────────────┬─────────────────┐
+│ Role         │ Username   │ Password        │ Name            │
+├──────────────┼────────────┼─────────────────┼─────────────────┤
+│ Admin        │ A001       │ admin123        │ Admin User      │
+│ Doctor       │ D001       │ doctor123       │ Dr. John Kamau  │
+│ Receptionist │ R001       │ receptionist123 │ Mary Wanjiku    │
+└──────────────┴────────────┴─────────────────┴─────────────────┘
 
-# 🚀 HOW TO RUN THE SERVER
+Example Request:
+{
+    "username": "A001",
+    "password": "admin123",
+    "role": "admin"
+}
 
-# 
-# 1. Activate virtual environment:
-#    source venv/bin/activate
-# 
-# 2. Start the server:
-#    uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
-# 
-#    Or with custom port:
-#    uvicorn src.main:app --reload --port 8000
-# 
-# 3. For production (without reload):
-#    uvicorn src.main:app --host 0.0.0.0 --port 8000
-# 
+----------------------------------------------------------------------------------------------------
+PUBLIC ROUTES (No Authentication Required)
+----------------------------------------------------------------------------------------------------
 
-# 📚 API DOCUMENTATION
+[ROOT & HEALTH]
+────────────────────────────────────────────────────────────────────────────────────
+GET    /                             - API root with links to documentation
+GET    /api/health                   - Health check endpoint
 
-# 
-# Once server is running, visit:
-# 🔹 Swagger UI: http://localhost:8000/docs
-# 🔹 ReDoc:      http://localhost:8000/redoc
-# 
+[DOCTOR ROUTES]
+────────────────────────────────────────────────────────────────────────────────────
+POST   /api/doctors/login            - Authenticate user (returns JWT token)
+GET    /api/doctors                   - Get all doctors
+GET    /api/doctors/{doctor_id}       - Get specific doctor by ID
 
-# 🔑 DEFAULT LOGIN CREDENTIALS
+[PATIENT ROUTES]
+────────────────────────────────────────────────────────────────────────────────────
+GET    /api/patients                  - Get all patients (filters: search, status)
+GET    /api/patients/{patient_id}     - Get specific patient by ID
+POST   /api/patients                  - Create new patient
+PUT    /api/patients/{patient_id}     - Update patient information
 
-# 
-# 👑 Admin:
-#    Username: admin1
-#    Password: admin123
-#    Role: admin
-# 
-# 👨‍⚕️ Doctor:
-#    Username: doctor1
-#    Password: doc123
-#    Role: doctor
-# 
-# 🧑‍💼 Receptionist:
-#    Username: receptionist1
-#    Password: rec123
-#    Role: receptionist
+[QUEUE ROUTES]
+────────────────────────────────────────────────────────────────────────────────────
+GET    /api/queue/current             - Get current consultation (filters: doctor_id, department)
+GET    /api/queue/waiting             - Get waiting patients (filters: doctor_id, department)
+POST   /api/queue/register             - Register patient to queue (params: patient_id, department, condition, priority, doctor_id)
+GET    /api/queue/status               - Get queue statistics
+
+[PRESCRIPTION ROUTES]
+────────────────────────────────────────────────────────────────────────────────────
+GET    /api/prescriptions              - Get prescriptions (filters: search, patient_id)
+POST   /api/prescriptions              - Create prescription (params: patient_id, medication, instructions, dosage, duration, doctor_id)
+
+
+----------------------------------------------------------------------------------------------------
+PROTECTED ROUTES (Authentication Required)
+----------------------------------------------------------------------------------------------------
+
+[DOCTOR ROUTES - Any Authenticated User]
+────────────────────────────────────────────────────────────────────────────────────
+GET    /api/doctors/current            - Get currently logged-in user info
+
+[RECEPTIONIST ROUTES - Receptionist or Admin]
+────────────────────────────────────────────────────────────────────────────────────
+GET    /api/receptionist/dashboard          - Receptionist dashboard statistics
+POST   /api/receptionist/patients/quick      - Quick patient registration
+GET    /api/receptionist/queue               - Get patients in queue (filter: department)
+GET    /api/receptionists                     - Get all receptionists
+GET    /api/receptionists/active              - Get only active receptionists
+GET    /api/receptionists/{receptionist_id}   - Get receptionist by ID
+GET    /api/receptionists/employee/{employee_id} - Get receptionist by employee ID
+
+[QUEUE MANAGEMENT - Receptionist/Admin/Doctor]
+────────────────────────────────────────────────────────────────────────────────────
+GET    /api/queue/priority             - Get queue organized by priority (filter: department)
+POST   /api/queue/next/{doctor_id}     - Call next patient for a doctor
+
+[PATIENT SEARCH - Receptionist/Admin/Doctor]
+────────────────────────────────────────────────────────────────────────────────────
+GET    /api/patients/search/{query}    - Search patients by name or phone
+
+[NOTIFICATION ROUTES - All Authenticated Users]
+────────────────────────────────────────────────────────────────────────────────────
+GET    /api/notifications               - Get notifications for current user's role (limit: 50)
+GET    /api/notifications/unread/count  - Get count of unread notifications
+PUT    /api/notifications/{notification_id}/read - Mark notification as read
+PUT    /api/notifications/read-all       - Mark all notifications as read for current role
+
+[PATIENT ROUTES - Admin Only]
+────────────────────────────────────────────────────────────────────────────────────
+DELETE /api/patients/{patient_id}       - Delete patient (Admin only)
+
+[RECEPTIONIST MANAGEMENT - Admin Only]
+────────────────────────────────────────────────────────────────────────────────────
+POST   /api/receptionists                - Create new receptionist
+PUT    /api/receptionists/{receptionist_id} - Update receptionist information
+DELETE /api/receptionists/{receptionist_id} - Delete/Deactivate receptionist
+
+
+----------------------------------------------------------------------------------------------------
+ADMIN ONLY ROUTES
+----------------------------------------------------------------------------------------------------
+
+[DASHBOARD]
+────────────────────────────────────────────────────────────────────────────────────
+GET    /api/admin/dashboard              - Complete admin dashboard statistics
+
+[STAFF MANAGEMENT]
+────────────────────────────────────────────────────────────────────────────────────
+GET    /api/admin/staff                  - Get all staff members (filters: role, department)
+GET    /api/admin/staff/{staff_id}       - Get specific staff by ID
+GET    /api/admin/staff/employee/{staff_id_str} - Get staff by employee ID (e.g., D001)
+GET    /api/admin/staff/statistics       - Get staff statistics (counts by role, status)
+POST   /api/admin/staff                  - Create new staff member
+PUT    /api/admin/staff/{staff_id}       - Update staff information
+DELETE /api/admin/staff/{staff_id}       - Delete staff member (soft delete)
+
+[BED MANAGEMENT]
+────────────────────────────────────────────────────────────────────────────────────
+GET    /api/admin/beds                   - Get all beds with occupancy status
+POST   /api/admin/beds/{bed_id}/assign   - Assign bed to patient (params: patient_id)
+POST   /api/admin/beds/{bed_id}/release  - Release bed from patient
+
+[INVENTORY MANAGEMENT]
+────────────────────────────────────────────────────────────────────────────────────
+GET    /api/admin/inventory              - Get all inventory items with status
+PUT    /api/admin/inventory/{item_id}    - Update inventory quantity (params: quantity_change)
+
+[ACTIVITY LOGS]
+────────────────────────────────────────────────────────────────────────────────────
+GET    /api/admin/activity-logs          - Get recent activity logs (limit: 10)
+
+[RECORDS & REPORTS]
+────────────────────────────────────────────────────────────────────────────────────
+GET    /api/admin/records                - Get all records (doctors, nurses, patients)
+GET    /api/admin/reports/monthly        - Generate monthly report with statistics
+
+
+----------------------------------------------------------------------------------------------------
+SUMMARY
+----------------------------------------------------------------------------------------------------
+Total Routes: 52
+├── Public Routes: 15
+└── Protected Routes: 37
+    ├── Any Authenticated User: 5
+    ├── Receptionist/Admin: 8
+    ├── Receptionist/Admin/Doctor: 4
+    └── Admin Only: 20
+
+----------------------------------------------------------------------------------------------------
+USAGE EXAMPLES
+----------------------------------------------------------------------------------------------------
+
+1. LOGIN AS ADMIN:
+   curl -X POST http://localhost:8000/api/doctors/login \
+     -H "Content-Type: application/json" \
+     -d '{"username":"A001","password":"admin123","role":"admin"}'
+
+2. ACCESS ADMIN DASHBOARD (with token):
+   curl -X GET http://localhost:8000/api/admin/dashboard \
+     -H "Authorization: Bearer <your_token_here>"
+
+3. CREATE NEW STAFF (Admin only):
+   curl -X POST http://localhost:8000/api/admin/staff \
+     -H "Authorization: Bearer <token>" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "staff_id": "D002",
+       "name": "Dr. Jane Smith",
+       "role": "doctor",
+       "phone": "+254700111555",
+       "email": "jane.smith@hospital.com",
+       "department": "Pediatrics",
+       "specialization": "Pediatrician",
+       "password": "doctor456"
+     }'
+
+4. QUICK REGISTER PATIENT (Receptionist):
+   curl -X POST http://localhost:8000/api/receptionist/patients/quick \
+     -H "Authorization: Bearer <token>" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "patient_name": "John Doe",
+       "phone": "+254722333444",
+       "age": 35,
+       "gender": "male",
+       "department": "Cardiology",
+       "condition": "Chest pain",
+       "priority": 2
+     }'
+
+5. GET QUEUE BY PRIORITY:
+   curl -X GET "http://localhost:8000/api/queue/priority?department=Cardiology" \
+     -H "Authorization: Bearer <token>"
+
+6. SEARCH PATIENTS:
+   curl -X GET "http://localhost:8000/api/patients/search/John" \
+     -H "Authorization: Bearer <token>"
+
+7. CHECK NOTIFICATIONS:
+   curl -X GET http://localhost:8000/api/notifications \
+     -H "Authorization: Bearer <token>"
+
+8. GENERATE MONTHLY REPORT (Admin):
+   curl -X GET http://localhost:8000/api/admin/reports/monthly \
+     -H "Authorization: Bearer <admin_token>"
+   /api/admin/activity-logs   - Activity logs
+"""
