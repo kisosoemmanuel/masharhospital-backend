@@ -3,9 +3,13 @@ from datetime import datetime, timedelta
 from src.models.admin import (
     staff_db, beds_db, inventory_db, activity_log_db,
     Staff, StaffCreate, StaffUpdate, StaffRole, StaffStatus,
-    Bed, InventoryItem, ActivityLog, next_staff_id, next_activity_id
+    Bed, InventoryItem, ActivityLog
 )
 from src.models.doctor import DoctorModel, hash_password
+
+# Global counters for generating new IDs
+next_staff_id = max(staff_db.keys()) + 1 if staff_db else 1
+next_activity_id = len(activity_log_db) + 1 if activity_log_db else 1
 
 class AdminService:
     
@@ -187,7 +191,7 @@ class AdminService:
             "total_beds": total_beds,
             "occupied_beds": occupied_beds,
             "available_beds": available_beds,
-            "occupancy_rate": round((occupied_beds / total_beds) * 100, 1),
+            "occupancy_rate": round((occupied_beds / total_beds) * 100, 1) if total_beds > 0 else 0,
             "by_department": beds_by_dept
         }
 
@@ -305,16 +309,24 @@ class AdminService:
         total_patients = len(patients_db)
         
         # Today's patients
-        today_start = datetime.now().replace(hour=0, minute=0, second=0)
+        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         patients_today = len([
             c for c in consultations_db.values()
-            if c["created_at"] >= today_start
+            if c.get("created_at", datetime.now()) >= today_start
         ])
         
         # Currently in hospital (in progress or waiting)
         current_patients = len([
             c for c in consultations_db.values()
-            if c["status"] in ["in_progress", "waiting"]
+            if c.get("status") in ["in_progress", "waiting"]
+        ])
+        
+        # Discharged today
+        discharged_today = len([
+            c for c in consultations_db.values()
+            if c.get("status") == "treated" 
+            and c.get("completed_at") 
+            and c["completed_at"] >= today_start
         ])
         
         return {
@@ -325,10 +337,7 @@ class AdminService:
                 "total": total_patients,
                 "today": patients_today,
                 "current": current_patients,
-                "discharged_today": len([
-                    c for c in consultations_db.values()
-                    if c["status"] == "treated" and c["completed_at"] and c["completed_at"] >= today_start
-                ])
+                "discharged_today": discharged_today
             },
             "recent_activity": recent_activity,
             "last_updated": datetime.now().isoformat()
@@ -392,8 +401,8 @@ class AdminService:
         from src.models.patients import consultations_db
         
         for consultation in consultations_db.values():
-            if consultation["patient_id"] == patient_id:
-                return consultation["condition"]
+            if consultation.get("patient_id") == patient_id:
+                return consultation.get("condition", "Not specified")
         return "Not specified"
 
     # ========== Report Generation ==========
@@ -401,20 +410,20 @@ class AdminService:
     @staticmethod
     def generate_monthly_report() -> Dict:
         """Generate monthly report"""
-        month_start = datetime.now().replace(day=1, hour=0, minute=0, second=0)
+        month_start = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         
         from src.models.patients import consultations_db
         
         # Monthly consultations
         monthly_consultations = [
             c for c in consultations_db.values()
-            if c["created_at"] >= month_start
+            if c.get("created_at", datetime.now()) >= month_start
         ]
         
         # By doctor
         by_doctor = {}
         for consultation in monthly_consultations:
-            doctor_id = consultation["doctor_id"]
+            doctor_id = consultation.get("doctor_id")
             doctor_name = next(
                 (s["name"] for s in staff_db.values() if s["id"] == doctor_id),
                 f"Doctor {doctor_id}"
@@ -427,10 +436,18 @@ class AdminService:
         # By department
         by_department = {}
         for consultation in monthly_consultations:
-            dept = consultation["department"]
+            dept = consultation.get("department", "General")
             if dept not in by_department:
                 by_department[dept] = 0
             by_department[dept] += 1
+        
+        # Calculate peak day
+        days = []
+        for consultation in monthly_consultations:
+            if consultation.get("created_at"):
+                days.append(consultation["created_at"].day)
+        
+        peak_day = max(set(days), key=days.count) if days else 1
         
         # Log report generation
         AdminService.log_activity(
@@ -447,7 +464,6 @@ class AdminService:
             "total_consultations": len(monthly_consultations),
             "by_doctor": by_doctor,
             "by_department": by_department,
-            "average_per_day": round(len(monthly_consultations) / 30, 1),
-            "peak_day": max(set([c["created_at"].day for c in monthly_consultations]), 
-                           key=list([c["created_at"].day for c in monthly_consultations]).count)
-        }
+            "average_per_day": round(len(monthly_consultations) / 30, 1) if monthly_consultations else 0,
+            "peak_day": peak_day
+        }  
