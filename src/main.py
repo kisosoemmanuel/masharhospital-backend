@@ -1002,20 +1002,22 @@ async def get_queue_by_priority(
     }
 
 
+# ========== FIXED ROUTE ==========
 @app.post("/api/queue/next/{doctor_id}")
 async def call_next_patient(
     doctor_id: int, 
     current_user: dict = Depends(get_medical_staff)
 ):
     """Call the next patient for a doctor"""
-    result = ReceptionistService.call_next_patient(doctor_id)
+    # Directly call QueueManager (bypass ReceptionistService)
+    result = QueueManager.call_next_patient(doctor_id)
     if not result.get("success"):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=result.get("error", "No patients in queue"),
         )
-    
     return result
+# ==================================
 
 
 # --------------------------------------------------
@@ -1326,12 +1328,6 @@ if __name__ == "__main__":
         reload=True,
         log_level="info"
     )
-
-
-
-
-
-
 """
 ====================================================================================================
 MASHAR HOSPITAL API - COMPLETE ROUTES & LOGIN CREDENTIALS
