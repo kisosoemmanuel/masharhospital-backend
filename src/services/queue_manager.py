@@ -11,7 +11,7 @@ class QueueManager:
     
     @classmethod
     def initialize(cls):
-        """Initialize queue manager"""
+        """Initialize queue manager and check for any active consultations"""
         try:
             if consultations_db:
                 # Get max queue number safely
@@ -23,6 +23,15 @@ class QueueManager:
             else:
                 cls._current_queue_number = 1
             print(f"Queue Manager initialized. Current queue number: {cls._current_queue_number}")
+
+            # --- Warn if any active consultations exist at startup ---
+            active = [c for c in consultations_db.values() if c.get("status") == "in_progress"]
+            if active:
+                print("WARNING: Active consultations found on startup:")
+                for c in active:
+                    print(f"  - id={c.get('id')}, doctor={c.get('doctor_id')}, started={c.get('started_at')}")
+            # ---------------------------------------------------------
+
         except Exception as e:
             print(f"Error initializing queue manager: {e}")
             cls._current_queue_number = 1
@@ -37,6 +46,10 @@ class QueueManager:
                         continue
                     if department and consultation.get("department") != department:
                         continue
+                    
+                    # --- LOGGING ---
+                    print(f"[get_current] Found active consultation: id={consultation.get('id')}, doctor={consultation.get('doctor_id')}, status={consultation.get('status')}")
+                    # -----------------
                     
                     # Enrich with patient data
                     patient = patients_db.get(consultation.get("patient_id"))
@@ -248,7 +261,7 @@ class QueueManager:
         diagnosis: Optional[str] = None,
         satisfaction_rating: Optional[int] = None
     ) -> Optional[Dict]:
-        """Complete a consultation with prescription"""
+        """Complete a consultation with prescription, but do NOT auto-start next patient."""
         try:
             consultation = consultations_db.get(consultation_id)
             
@@ -257,6 +270,10 @@ class QueueManager:
                     "success": False,
                     "error": "Consultation not found"
                 }
+            
+            # --- LOGGING ---
+            print(f"[complete] Attempting to complete consultation {consultation_id} for doctor {doctor_id}, current status: {consultation.get('status')}")
+            # -----------------
             
             if consultation["status"] != "in_progress":
                 return {
@@ -275,6 +292,10 @@ class QueueManager:
             consultation["completed_at"] = datetime.now()
             if satisfaction_rating:
                 consultation["satisfaction_rating"] = satisfaction_rating
+            
+            # --- LOGGING ---
+            print(f"[complete] After update: status={consultation['status']}, completed_at={consultation.get('completed_at')}")
+            # -----------------
             
             # Create prescription if medication provided
             prescription = None
@@ -297,8 +318,7 @@ class QueueManager:
                 next_prescription_id += 1
                 prescription = new_prescription
             
-            # Process next in queue
-            next_patient = cls._process_next_in_queue(consultation["doctor_id"], consultation["department"])
+            # Do NOT automatically start the next patient - doctor will call call_next_patient explicitly
             
             # Get patient info
             patient = patients_db.get(consultation["patient_id"])
@@ -308,7 +328,7 @@ class QueueManager:
                 "consultation": consultation,
                 "patient": patient,
                 "prescription": prescription,
-                "next_patient": next_patient,
+                "next_patient": None,  # No auto-start
                 "message": "Consultation completed successfully"
             }
             
@@ -525,6 +545,116 @@ class QueueManager:
             }
 
     @classmethod
+    def get_doctor_queue_stats(cls, doctor_id: int) -> Dict:
+        """Get queue statistics for a specific doctor"""
+        try:
+            # Get waiting patients count
+            waiting_patients = cls.get_waiting_patients(doctor_id=doctor_id)
+            waiting_count = len(waiting_patients)
+            
+            # Get current consultation
+            current_consultation = cls.get_current_consultation(doctor_id=doctor_id)
+            
+            # Get current patient details
+            current_patient = None
+            if current_consultation:
+                current_patient = {
+                    "id": current_consultation.get("id"),
+                    "patient_id": current_consultation.get("patient_id"),
+                    "patient_name": current_consultation.get("patient", {}).get("name"),
+                    "status": current_consultation.get("status"),
+                    "queue_number": current_consultation.get("queue_number"),
+                    "waiting_time": current_consultation.get("waiting_time")
+                }
+            
+            return {
+                "waiting": waiting_count,
+                "current_patient": current_patient
+            }
+            
+        except Exception as e:
+            print(f"Error getting doctor queue stats: {e}")
+            return {
+                "waiting": 0,
+                "current_patient": None
+            }
+
+    # ========== UPDATED METHOD WITH SAFETY NET ==========
+    @classmethod
+    def call_next_patient(cls, doctor_id: int) -> Dict:
+        """
+        Call the next patient for a specific doctor.
+        Returns the consultation that is now in progress.
+        """
+        try:
+            # --- LOGGING ---
+            print(f"[call_next] Checking for doctor {doctor_id}")
+            # -----------------
+
+            # --- SAFETY NET: Auto‑clear any stuck active consultation for this doctor ---
+            cleared_any = False
+            for cons in consultations_db.values():
+                if cons.get("doctor_id") == doctor_id and cons.get("status") == "in_progress":
+                    cons["status"] = "treated"
+                    cons["completed_at"] = datetime.now()
+                    cons["notes"] = "Auto‑completed by call_next_patient (cleanup)"
+                    print(f"[call_next] Auto‑completed stuck consultation {cons['id']} for doctor {doctor_id}")
+                    cleared_any = True
+            if cleared_any:
+                print("[call_next] Cleared at least one stuck consultation. Now proceeding to call next patient.")
+            # ------------------------------------------------------------------------------
+
+            # 1. Check if the doctor already has an active consultation
+            current = cls.get_current_consultation(doctor_id=doctor_id)
+            print(f"[call_next] get_current_consultation returned: {current}")
+
+            if current:
+                return {
+                    "success": False,
+                    "error": "Doctor already has an active consultation",
+                    "message": "Please complete the current consultation first"
+                }
+
+            # 2. Get waiting patients for this doctor
+            waiting_patients = cls.get_waiting_patients(doctor_id=doctor_id)
+
+            if not waiting_patients:
+                return {
+                    "success": False,
+                    "error": "No waiting patients for this doctor",
+                    "message": "Queue is empty"
+                }
+
+            # 3. Take the first patient (highest priority, earliest queue number)
+            next_patient = waiting_patients[0]
+            consultation_id = next_patient["id"]
+
+            # 4. Start the consultation
+            result = cls.start_consultation(consultation_id, doctor_id)
+
+            if not result.get("success"):
+                return {
+                    "success": False,
+                    "error": result.get("error", "Failed to start consultation")
+                }
+
+            # 5. Return the consultation with patient data
+            return {
+                "success": True,
+                "consultation": result["consultation"],
+                "patient": result["patient"],
+                "message": f"Patient {result['patient'].get('name')} called for consultation"
+            }
+
+        except Exception as e:
+            print(f"Error calling next patient: {e}")
+            return {
+                "success": False,
+                "error": f"Failed to call next patient: {str(e)}"
+            }
+    # ====================================================
+
+    @classmethod
     def _estimate_wait_time(cls, consultation: Dict) -> str:
         """Estimate wait time for a patient"""
         try:
@@ -611,4 +741,4 @@ class QueueManager:
             
         except Exception as e:
             print(f"Error getting queue history: {e}")
-            return [] 
+            return []
