@@ -1,31 +1,22 @@
-from typing import Optional, Dict, List
+from sqlalchemy import Column, Integer, String, DateTime
+from sqlalchemy.orm import Session
+from datetime import datetime
+from typing import Optional, List, Dict
 from pydantic import BaseModel
-from datetime import datetime, timedelta
 from passlib.context import CryptContext
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
+from src.database import Base
 
 # -----------------------------
 # Password Hashing
 # -----------------------------
-pwd_context = CryptContext(
-    schemes=["bcrypt"],
-    deprecated="auto",
-    bcrypt__rounds=12
-)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# Password utilities
 def hash_password(password: str) -> str:
-    """Hash a password using bcrypt"""
     if len(password.encode("utf-8")) > 72:
         password = password[:72]
     return pwd_context.hash(password)
 
-
 def verify_password(password: str, hashed: str) -> bool:
-    """Verify a password against its hash"""
     try:
         if len(password.encode("utf-8")) > 72:
             password = password[:72]
@@ -33,50 +24,39 @@ def verify_password(password: str, hashed: str) -> bool:
     except Exception:
         return False
 
+# -----------------------------
+# SQLAlchemy Table Model
+# -----------------------------
+class Receptionist(Base):
+    __tablename__ = "receptionists"
 
-# Receptionist "database"
-receptionist_db: Dict[int, Dict] = {}
-next_receptionist_id: int = 1
+    id = Column(Integer, primary_key=True, index=True)
+    employee_id = Column(String, unique=True, index=True)
+    name = Column(String)
+    phone = Column(String)
+    email = Column(String, nullable=True)
+    department = Column(String, default="Front Desk")
+    status = Column(String, default="active")
+    hashed_password = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, onupdate=datetime.utcnow)
+    last_login = Column(DateTime, nullable=True)
+    
+    # Adding this property to match the logic used in main.py for staff roles
+    @property
+    def role(self):
+        return "receptionist"
 
-# Sample data
-receptionist_db[1] = {
-    "id": 1,
-    "employee_id": "R001",
-    "name": "Mary Wanjiku",
-    "phone": "+254700111444",
-    "email": "mary.wanjiku@hospital.com",
-    "department": "Front Desk",
-    "status": "active",
-    "created_at": datetime.now() - timedelta(days=365*2),
-    "updated_at": None,
-    "hashed_password": hash_password("receptionist123"),
-    "last_login": datetime.now() - timedelta(days=2)
-}
-
-receptionist_db[2] = {
-    "id": 2,
-    "employee_id": "R002",
-    "name": "John Doe",
-    "phone": "+254700111555",
-    "email": "john.doe@hospital.com",
-    "department": "Front Desk",
-    "status": "active",
-    "created_at": datetime.now() - timedelta(days=180),
-    "updated_at": None,
-    "hashed_password": hash_password("receptionist456"),
-    "last_login": None
-}
-
-
-# Pydantic Models
+# -----------------------------
+# Pydantic Schemas
+# -----------------------------
 class ReceptionistCreate(BaseModel):
     employee_id: str
     name: str
     phone: str
     email: Optional[str] = None
-    department: Optional[str] = "General"
+    department: Optional[str] = "Front Desk"
     password: str
-
 
 class ReceptionistUpdate(BaseModel):
     name: Optional[str] = None
@@ -85,177 +65,84 @@ class ReceptionistUpdate(BaseModel):
     department: Optional[str] = None
     status: Optional[str] = None
 
-
 class ReceptionistLogin(BaseModel):
     employee_id: str
     password: str
-    role: Optional[str] = "receptionist"  # Default to receptionist, but can be overridden
 
-
+# -----------------------------
+# Receptionist Model Logic
+# -----------------------------
 class ReceptionistModel:
     
-    # -----------------------------
-    # AUTHENTICATION (NEW)
-    # -----------------------------
     @staticmethod
-    def authenticate(employee_id: str, password: str, role: Optional[str] = None) -> Optional[Dict]:
+    def authenticate(db: Session, employee_id: str, password: str) -> Optional[Receptionist]:
         """
-        Authenticate a receptionist.
-        If role is provided, try that role first.
-        If no role provided or role-specific auth fails, try all roles.
+        Authenticate a receptionist. 
+        Returns the Receptionist object if successful to match main.py logic.
         """
-        print(f"Receptionist authentication attempt - Employee ID: {employee_id}, Role: {role}")
+        user = db.query(Receptionist).filter(Receptionist.employee_id == employee_id).first()
         
-        user = None
-        
-        # If role is provided, try that specific role first
-        if role:
-            for u in receptionist_db.values():
-                if u["employee_id"] == employee_id and u.get("role", "receptionist") == role:
-                    user = u
-                    print(f"Found receptionist with matching role: {user['name']}")
-                    break
-        
-        # If no user found with that role or no role provided, try all roles
-        if not user:
-            print("Trying all receptionists...")
-            for u in receptionist_db.values():
-                if u["employee_id"] == employee_id:
-                    user = u
-                    print(f"Found receptionist: {user['name']}")
-                    break
-        
-        if not user:
-            print(f"No receptionist found with ID: {employee_id}")
+        if not user or not verify_password(password, user.hashed_password):
             return None
         
-        # Verify password
-        if not verify_password(password, user["hashed_password"]):
-            print("Password verification failed")
-            return None
+        # Update last login timestamp
+        user.last_login = datetime.utcnow()
+        db.commit()
+        db.refresh(user)
         
-        print(f"Authentication successful for {employee_id}")
-        
-        # Update last login
-        user["last_login"] = datetime.now()
-        
-        return {
-            "success": True,
-            "user": {
-                "id": user["id"],
-                "employee_id": user["employee_id"],
-                "name": user["name"],
-                "role": "receptionist",  # Always receptionist for this model
-                "department": user.get("department"),
-                "phone": user.get("phone"),
-                "email": user.get("email")
-            }
-        }
-
-    # -----------------------------
-    # CRUD Operations
-    # -----------------------------
-    
-    @staticmethod
-    def create_receptionist(data: ReceptionistCreate) -> Dict:
-        global next_receptionist_id
-        r_id = next_receptionist_id
-        
-        # Check if employee_id already exists
-        for receptionist in receptionist_db.values():
-            if receptionist["employee_id"] == data.employee_id:
-                return {"success": False, "error": "Employee ID already exists"}
-        
-        receptionist_db[r_id] = {
-            "id": r_id,
-            "employee_id": data.employee_id,
-            "name": data.name,
-            "phone": data.phone,
-            "email": data.email,
-            "department": data.department,
-            "status": "active",
-            "created_at": datetime.now(),
-            "updated_at": None,
-            "hashed_password": hash_password(data.password),
-            "last_login": None
-        }
-        next_receptionist_id += 1
-        
-        return {
-            "success": True,
-            "receptionist": ReceptionistModel.get_by_id(r_id)
-        }
+        return user
 
     @staticmethod
-    def update_receptionist(r_id: int, data: ReceptionistUpdate) -> Optional[Dict]:
-        receptionist = receptionist_db.get(r_id)
-        if not receptionist:
+    def create_receptionist(db: Session, data: ReceptionistCreate) -> Dict:
+        """Create a new receptionist record."""
+        existing = db.query(Receptionist).filter(Receptionist.employee_id == data.employee_id).first()
+        if existing:
+            return {"success": False, "error": "Employee ID already exists"}
+        
+        new_rec = Receptionist(
+            employee_id=data.employee_id,
+            name=data.name,
+            phone=data.phone,
+            email=data.email,
+            department=data.department,
+            hashed_password=hash_password(data.password)
+        )
+        
+        db.add(new_rec)
+        db.commit()
+        db.refresh(new_rec)
+        
+        return {"success": True, "receptionist": new_rec}
+
+    @staticmethod
+    def update_receptionist(db: Session, r_id: int, data: ReceptionistUpdate) -> Optional[Receptionist]:
+        """Update existing receptionist data."""
+        rec = db.query(Receptionist).filter(Receptionist.id == r_id).first()
+        if not rec:
             return None
             
-        for key, value in data.dict(exclude_unset=True).items():
-            if value is not None:
-                receptionist[key] = value
+        update_data = data.model_dump(exclude_unset=True)
+        for key, value in update_data.items():
+            setattr(rec, key, value)
                 
-        receptionist["updated_at"] = datetime.now()
-        return receptionist
+        db.commit()
+        db.refresh(rec)
+        return rec
 
     @staticmethod
-    def get_all() -> List[Dict]:
-        return list(receptionist_db.values())
-    
-    @staticmethod
-    def get_all_receptionists() -> List[Dict]:
-        """Get all receptionists (alias for get_all)"""
-        return list(receptionist_db.values())
-    
-    @staticmethod
-    def get_active_receptionists() -> List[Dict]:
-        """Get only active receptionists"""
-        return [r for r in receptionist_db.values() if r.get("status", "active") == "active"]
+    def get_all(db: Session) -> List[Receptionist]:
+        return db.query(Receptionist).all()
 
     @staticmethod
-    def get_by_id(r_id: int) -> Optional[Dict]:
-        receptionist = receptionist_db.get(r_id)
-        if receptionist:
-            # Don't return sensitive data
-            return {
-                "id": receptionist["id"],
-                "employee_id": receptionist["employee_id"],
-                "name": receptionist["name"],
-                "phone": receptionist["phone"],
-                "email": receptionist.get("email"),
-                "department": receptionist.get("department"),
-                "status": receptionist.get("status", "active"),
-                "created_at": receptionist["created_at"],
-                "last_login": receptionist.get("last_login")
-            }
-        return None
-    
-    @staticmethod
-    def get_by_employee_id(employee_id: str) -> Optional[Dict]:
-        """Get receptionist by employee ID"""
-        for receptionist in receptionist_db.values():
-            if receptionist["employee_id"] == employee_id:
-                return ReceptionistModel.get_by_id(receptionist["id"])
-        return None
+    def get_by_id(db: Session, r_id: int) -> Optional[Receptionist]:
+        return db.query(Receptionist).filter(Receptionist.id == r_id).first()
 
     @staticmethod
-    def delete_receptionist(r_id: int) -> bool:
-        if r_id in receptionist_db:
-            # Soft delete - mark as inactive instead of removing
-            receptionist_db[r_id]["status"] = "inactive"
-            receptionist_db[r_id]["updated_at"] = datetime.now()
+    def delete_receptionist(db: Session, r_id: int) -> bool:
+        """Soft delete by setting status to inactive."""
+        rec = db.query(Receptionist).filter(Receptionist.id == r_id).first()
+        if rec:
+            rec.status = "inactive"
+            db.commit()
             return True
         return False
-    
-    @staticmethod
-    def permanently_delete(r_id: int) -> bool:
-        """Permanently delete a receptionist (use with caution)"""
-        if r_id in receptionist_db:
-            del receptionist_db[r_id]
-            return True
-        return False
-
-
-# Import timedelta for the sample data
-from datetime import timedelta

@@ -1,296 +1,155 @@
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
+from sqlalchemy.orm import Session
+from sqlalchemy import func, or_
 from src.models.patients import (
-    patients_db, consultations_db, prescriptions_db,
-    Patient, PatientCreate, PatientUpdate,
-    Consultation, Prescription
+    Patient, Consultation, Prescription,
+    PatientCreate, PatientUpdate
 )
 
 class PatientService:
     @staticmethod
-    def get_patients(search: Optional[str] = None, status: Optional[str] = None) -> List[Dict]:
-        """Get all patients with optional filters"""
-        patients = []
+    def get_patients(db: Session, search: Optional[str] = None, status: Optional[str] = None) -> List[Patient]:
+        """Get all patients from DB with optional search and status filters"""
+        query = db.query(Patient)
         
-        for patient_id, patient in patients_db.items():
-            # Apply search filter
-            if search and search.lower() not in patient["name"].lower():
-                continue
-            
-            # Get latest consultation for status
-            latest_consultation = PatientService._get_latest_consultation(patient_id)
-            
-            # Apply status filter if provided
-            if status and latest_consultation:
-                if latest_consultation["status"] != status:
-                    continue
-            
-            patient_data = {
-                **patient,
-                "latest_status": latest_consultation["status"] if latest_consultation else "No visits",
-                "latest_condition": latest_consultation["condition"] if latest_consultation else "N/A"
-            }
-            patients.append(patient_data)
+        if search:
+            query = query.filter(
+                or_(
+                    Patient.name.ilike(f"%{search}%"),
+                    Patient.phone.ilike(f"%{search}%")
+                )
+            )
         
+        # Note: Status usually lives in the Consultation table. 
+        # For a "Patient Status" filter, we check their most recent consultation.
+        patients = query.all()
+        
+        if status:
+            filtered_patients = []
+            for p in patients:
+                latest = PatientService._get_latest_consultation(db, p.id)
+                if latest and latest.status == status:
+                    filtered_patients.append(p)
+            return filtered_patients
+            
         return patients
 
     @staticmethod
-    def get_patient_by_id(patient_id: int) -> Optional[Dict]:
-        """Get patient by ID with consultation history"""
-        patient = patients_db.get(patient_id)
+    def get_patient_by_id(db: Session, patient_id: int) -> Optional[Dict]:
+        """Get patient by ID with full history from database"""
+        patient = db.query(Patient).filter(Patient.id == patient_id).first()
         if not patient:
             return None
         
-        # Get patient's consultations
-        consultations = []
-        for cons in consultations_db.values():
-            if cons["patient_id"] == patient_id:
-                consultations.append(cons)
-        
-        # Get patient's prescriptions
-        prescriptions = PatientService._get_patient_prescriptions(patient_id)
+        # Get history
+        consultations = db.query(Consultation).filter(Consultation.patient_id == patient_id).order_by(Consultation.created_at.desc()).all()
+        prescriptions = db.query(Prescription).filter(Prescription.patient_id == patient_id).all()
         
         return {
-            **patient,
-            "consultations": sorted(consultations, key=lambda x: x["created_at"], reverse=True),
+            "patient": patient,
+            "consultations": consultations,
             "prescriptions": prescriptions
         }
 
     @staticmethod
-    def create_patient(patient_data: PatientCreate) -> Dict:
-        """Create a new patient"""
-        new_id = max(patients_db.keys()) + 1
-        new_patient = {
-            "id": new_id,
+    def create_patient(db: Session, patient_data: PatientCreate) -> Patient:
+        """Create a new patient record in the database"""
+        new_patient = Patient(
             **patient_data.dict(),
-            "created_at": datetime.now(),
-            "updated_at": None
-        }
-        patients_db[new_id] = new_patient
+            created_at=datetime.utcnow()
+        )
+        db.add(new_patient)
+        db.commit()
+        db.refresh(new_patient)
         return new_patient
 
     @staticmethod
-    def update_patient(patient_id: int, patient_update: PatientUpdate) -> Optional[Dict]:
-        """Update patient information"""
-        if patient_id not in patients_db:
+    def update_patient(db: Session, patient_id: int, patient_update: PatientUpdate) -> Optional[Patient]:
+        """Update existing patient information"""
+        patient = db.query(Patient).filter(Patient.id == patient_id).first()
+        if not patient:
             return None
         
-        patient = patients_db[patient_id]
         update_data = patient_update.dict(exclude_unset=True)
-        
         for key, value in update_data.items():
-            if value is not None:
-                patient[key] = value
+            setattr(patient, key, value)
         
-        patient["updated_at"] = datetime.now()
+        patient.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(patient)
         return patient
 
     @staticmethod
-    def delete_patient(patient_id: int) -> bool:
-        """Delete a patient (admin only)"""
-        if patient_id in patients_db:
-            del patients_db[patient_id]
+    def delete_patient(db: Session, patient_id: int) -> bool:
+        """Permanently delete a patient"""
+        patient = db.query(Patient).filter(Patient.id == patient_id).first()
+        if patient:
+            db.delete(patient)
+            db.commit()
             return True
         return False
 
     @staticmethod
-    def _get_latest_consultation(patient_id: int) -> Optional[Dict]:
-        """Get latest consultation for a patient"""
-        patient_consultations = [
-            cons for cons in consultations_db.values()
-            if cons["patient_id"] == patient_id
-        ]
-        
-        if patient_consultations:
-            return max(patient_consultations, key=lambda x: x["created_at"])
-        return None
+    def _get_latest_consultation(db: Session, patient_id: int) -> Optional[Consultation]:
+        """Helper to find a patient's most recent visit"""
+        return db.query(Consultation)\
+                 .filter(Consultation.patient_id == patient_id)\
+                 .order_by(Consultation.created_at.desc())\
+                 .first()
 
+    # ----------------------
+    # Statistics Logic
+    # ----------------------
     @staticmethod
-    def _get_patient_prescriptions(patient_id: int) -> List[Dict]:
-        """Get all prescriptions for a patient"""
-        return [
-            pres for pres in prescriptions_db.values()
-            if pres["patient_id"] == patient_id
-        ]
-
-    @staticmethod
-    def get_prescriptions(search: Optional[str] = None, patient_id: Optional[int] = None) -> List[Dict]:
-        """Get prescriptions with filters"""
-        prescriptions = []
+    def get_weekly_statistics(db: Session) -> Dict:
+        """Get real-time hospital statistics for the last 7 days"""
+        week_start = datetime.utcnow() - timedelta(days=7)
         
-        for pres_id, pres in prescriptions_db.items():
-            # Filter by patient_id if provided
-            if patient_id and pres["patient_id"] != patient_id:
-                continue
-            
-            # Get patient name for search
-            patient = patients_db.get(pres["patient_id"])
-            if search and patient and search.lower() not in patient["name"].lower():
-                continue
-            
-            # Enrich with patient name
-            pres_with_name = {
-                **pres,
-                "patient_name": patient["name"] if patient else "Unknown"
-            }
-            prescriptions.append(pres_with_name)
+        # Counts using optimized SQL count queries
+        new_patients = db.query(Patient).filter(Patient.created_at >= week_start).count()
+        total_consultations = db.query(Consultation).filter(Consultation.created_at >= week_start).count()
         
-        return sorted(prescriptions, key=lambda x: x["created_at"], reverse=True)
-
-    @staticmethod
-    def create_prescription(
-        patient_id: int,
-        doctor_id: int,
-        medication: str,
-        instructions: Optional[str] = None,
-        dosage: Optional[str] = None,
-        duration: Optional[str] = None,
-        consultation_id: Optional[int] = None
-    ) -> Dict:
-        """Create a new prescription"""
-        from src.models.patients import next_prescription_id, prescriptions_db
+        # Calculate Average Consultation Time (treated patients only)
+        completed = db.query(Consultation).filter(
+            Consultation.status == "treated",
+            Consultation.completed_at >= week_start,
+            Consultation.started_at != None
+        ).all()
         
-        global next_prescription_id
-        new_id = next_prescription_id
-        next_prescription_id += 1
-        
-        new_prescription = {
-            "id": new_id,
-            "patient_id": patient_id,
-            "doctor_id": doctor_id,
-            "consultation_id": consultation_id,
-            "medication": medication,
-            "instructions": instructions,
-            "dosage": dosage,
-            "duration": duration,
-            "created_at": datetime.now()
-        }
-        
-        prescriptions_db[new_id] = new_prescription
-        return new_prescription
-
-    @staticmethod
-    def get_weekly_statistics() -> Dict:
-        """Get weekly statistics"""
-        week_start = datetime.now() - timedelta(days=7)
-        
-        # Patients this week
-        patients_this_week = len([
-            p for p in patients_db.values()
-            if p["created_at"] >= week_start
-        ])
-        
-        # Consultations this week
-        consultations_this_week = [
-            c for c in consultations_db.values()
-            if c["created_at"] >= week_start
-        ]
-        
-        # Completed consultations (with time data)
-        completed = [
-            c for c in consultations_db.values()
-            if c["status"] == "treated"
-            and c["completed_at"] and c["started_at"]
-            and c["completed_at"] >= week_start
-        ]
-        
-        # Average consultation time
+        avg_time = 14 # Default fallback
         if completed:
-            total_time = sum([
-                (c["completed_at"] - c["started_at"]).total_seconds() / 60
-                for c in completed
-            ])
-            avg_consultation = round(total_time / len(completed))
-        else:
-            avg_consultation = 14  # Default from screenshot
-        
-        # Satisfaction rate
-        rated = [c for c in completed if c.get("satisfaction_rating")]
-        if rated:
-            satisfaction = round(
-                sum([c["satisfaction_rating"] for c in rated]) / len(rated) * 20
-            )
-        else:
-            satisfaction = 96  # Default from screenshot
-        
-        # Emergency cases today
-        today_start = datetime.now().replace(hour=0, minute=0, second=0)
-        emergency_today = len([
-            c for c in consultations_db.values()
-            if c["created_at"] >= today_start and c["priority"] == 3
-        ])
-        
+            times = [(c.completed_at - c.started_at).total_seconds() / 60 for c in completed]
+            avg_time = round(sum(times) / len(completed))
+
+        # Emergency count (Priority 3)
+        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0)
+        emergencies = db.query(Consultation).filter(
+            Consultation.created_at >= today_start,
+            Consultation.priority == 3
+        ).count()
+
         return {
-            "patients_this_week": patients_this_week,
-            "consultations_this_week": len(consultations_this_week),
-            "avg_consultation_time": avg_consultation,
-            "satisfaction_rate": satisfaction,
-            "emergency_today": emergency_today,
-            "department_stats": PatientService._get_department_stats(week_start)
+            "patients_this_week": new_patients,
+            "consultations_this_week": total_consultations,
+            "avg_consultation_time": avg_time,
+            "emergency_today": emergencies,
+            "timestamp": datetime.utcnow().isoformat()
         }
 
     @staticmethod
-    def get_doctor_statistics(doctor_id: int) -> Dict:
-        """Get statistics for a specific doctor"""
-        doctor_consultations = [
-            c for c in consultations_db.values()
-            if c["doctor_id"] == doctor_id
-        ]
+    def get_doctor_statistics(db: Session, doctor_id: int) -> Dict:
+        """Get performance and load stats for a specific doctor"""
+        doc_query = db.query(Consultation).filter(Consultation.doctor_id == doctor_id)
         
-        total_patients = len(doctor_consultations)
-        
-        # Today's patients
-        today_start = datetime.now().replace(hour=0, minute=0, second=0)
-        today_patients = len([
-            c for c in doctor_consultations
-            if c["created_at"] >= today_start
-        ])
-        
-        # Currently in progress
-        in_progress = len([
-            c for c in doctor_consultations
-            if c["status"] == "in_progress"
-        ])
-        
-        # Waiting
-        waiting = len([
-            c for c in doctor_consultations
-            if c["status"] == "waiting"
-        ])
+        total = doc_query.count()
+        waiting = doc_query.filter(Consultation.status == "waiting").count()
+        in_progress = doc_query.filter(Consultation.status == "in_progress").count()
         
         return {
             "doctor_id": doctor_id,
-            "total_patients": total_patients,
-            "today_patients": today_patients,
-            "in_progress": in_progress,
+            "total_patients": total,
             "waiting": waiting,
-            "completion_rate": round(
-                len([c for c in doctor_consultations if c["status"] == "treated"]) / 
-                max(total_patients, 1) * 100
-            )
+            "in_progress": in_progress,
+            "completion_rate": round((total - waiting - in_progress) / max(total, 1) * 100)
         }
-
-    @staticmethod
-    def _get_department_stats(week_start: datetime) -> Dict:
-        """Get statistics by department"""
-        departments = {}
-        
-        for consultation in consultations_db.values():
-            if consultation["created_at"] < week_start:
-                continue
-            
-            dept = consultation["department"]
-            if dept not in departments:
-                departments[dept] = {
-                    "total": 0,
-                    "emergency": 0,
-                    "completed": 0
-                }
-            
-            departments[dept]["total"] += 1
-            if consultation["priority"] == 3:
-                departments[dept]["emergency"] += 1
-            if consultation["status"] == "treated":
-                departments[dept]["completed"] += 1
-        
-        return departments
