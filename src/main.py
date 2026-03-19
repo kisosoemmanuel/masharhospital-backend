@@ -1,9 +1,6 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
-from fastapi.responses import JSONResponse
-from sqlalchemy.orm import Session
-from sqlalchemy import desc
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
@@ -12,21 +9,39 @@ import json
 import traceback
 from dotenv import load_dotenv
 from jose import JWTError, jwt
+from pydantic import BaseModel, ValidationError
 
 # Database Imports
+from sqlalchemy.orm import Session
+from sqlalchemy import desc
 from src.database import SessionLocal, engine, Base
 
 # Models & Services
 from src.models.doctor import DoctorModel, DoctorLogin, DoctorCreate
 from src.models.patients import (
-    Patient, PatientCreate, PatientUpdate, QuickRegistration, Prescription, Consultation, PatientModel  
+    Patient, PatientCreate, PatientUpdate, QuickRegistration,
+    Prescription, Consultation, PatientModel
 )
 from src.models.admin import StaffCreate, StaffUpdate, AdminModel, StaffLogin, Staff, StaffRole
 from src.models.receptionist import ReceptionistCreate, ReceptionistUpdate, ReceptionistModel, ReceptionistLogin
-from src.services.queue_manager import QueueManager 
+from src.services.queue_manager import QueueManager
 from src.services.patient_service import PatientService
 from src.services.admin_service import AdminService
 from src.services.receptionist_service import ReceptionistService
+
+# For export
+from fastapi.responses import Response, JSONResponse
+from io import BytesIO
+import openpyxl
+from openpyxl.styles import Font, Alignment, PatternFill
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.graphics.shapes import Drawing
+from reportlab.graphics.charts.barcharts import VerticalBarChart
+from collections import Counter
 
 load_dotenv()
 
@@ -38,6 +53,13 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30
 # DATABASE & LIFESPAN
 # --------------------------------------------------
 
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events with Database context"""
@@ -48,6 +70,7 @@ async def lifespan(app: FastAPI):
         print("✅ Database ready. API live!")
     except Exception as e:
         print(f"❌ Database initialization failed: {e}")
+        traceback.print_exc()
     yield
     print("🛑 Shutting down Mashar Hospital API...")
 
@@ -71,26 +94,18 @@ app = FastAPI(
     openapi_tags=tags_metadata
 )
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
 # --------------------------------------------------
 # MIDDLEWARE & SECURITY
 # --------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    # Explicitly list the frontend origins. Do NOT use "*" here.
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-        "http://localhost:5173",  # Common for Vite users
+        "http://localhost:5173",
         "http://127.0.0.1:5173",
     ],
-    allow_credentials=True,     # Required for authorization headers/cookies
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -112,74 +127,100 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         role = payload.get("role")
         if not username or not role:
             raise HTTPException(status_code=401, detail="Invalid token claims")
-        return {"username": username, "role": role} 
+        return {"username": username, "role": role}
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 def require_role(required_roles: List[str]):
-    def role_checker(current_user = Depends(get_current_user)):
+    async def role_checker(current_user = Depends(get_current_user)):
         if current_user["role"] not in required_roles:
             raise HTTPException(status_code=403, detail="Insufficient permissions")
         return current_user
     return role_checker
 
 # --------------------------------------------------
+# LOGIN MODELS
+# --------------------------------------------------
+class UniversalLoginRequest(BaseModel):
+    username: Optional[str] = None
+    staff_id: Optional[str] = None
+    employee_id: Optional[str] = None
+    password: str
+    role: Optional[str] = None
+
+# --------------------------------------------------
 # AUTHENTICATION ROUTES
 # --------------------------------------------------
-
 @app.post("/api/login", tags=["auth"])
 @app.post("/api/admin/login", tags=["auth"])
 @app.post("/api/doctors/login", tags=["auth"])
 @app.post("/api/receptionist/login", tags=["auth"])
-async def universal_login(request: Request, db: Session = Depends(get_db)):
+async def universal_login(
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """
+    Universal login endpoint that handles all role types.
+    Accepts flat JSON with username, staff_id, or employee_id plus password.
+    """
     try:
         body = await request.json()
-        print(f"DEBUG: Login Attempt with payload: {body}")
+        print(f"DEBUG: Login attempt payload: {body}")
 
-        # 1. Dig into nested objects (Handles {'employee_id': {'username': '...'}})
-        # We look for any value that is a dictionary and check it for credentials
-        data = body
-        for key, value in body.items():
-            if isinstance(value, dict) and ("username" in value or "staff_id" in value):
-                data = value
-                break
+        # Normalize: try to parse into our model
+        try:
+            login_data = UniversalLoginRequest(**body)
+        except ValidationError as e:
+            # If validation fails, maybe the frontend sent nested data (e.g., { employee_id: { username: ... } })
+            # Flatten by extracting any dict value
+            flat_body = {}
+            for key, value in body.items():
+                if isinstance(value, dict):
+                    # Merge nested dict into flat (e.g., employee_id dict)
+                    flat_body.update(value)
+                else:
+                    flat_body[key] = value
+            login_data = UniversalLoginRequest(**flat_body)
 
-        # 2. Extract credentials from the flattened data
-        username = data.get("username") or data.get("staff_id") or data.get("employee_id")
-        password = data.get("password")
-
-        if not username or not password:
+        # Determine the identifier
+        identifier = login_data.username or login_data.staff_id or login_data.employee_id
+        if not identifier or not login_data.password:
             return JSONResponse(
-                status_code=400, 
+                status_code=400,
                 content={"success": False, "detail": "Username and password required"}
             )
 
-        # 3. Authenticate
-        user = AdminModel.authenticate(db, staff_id=str(username), password=str(password))
-        
-        if user:
-            role_val = user.role.value if hasattr(user.role, 'value') else str(user.role)
-            token = create_access_token({"sub": str(user.staff_id), "role": role_val})
-            
-            return {
-                "success": True,
-                "access_token": token, 
-                "token_type": "bearer", 
-                "role": role_val, 
-                "username": user.name,
-                "staff_id": user.staff_id
-            }
+        # Authenticate against staff table (handles all roles)
+        user = AdminModel.authenticate(db, staff_id=str(identifier), password=str(login_data.password))
 
-        return JSONResponse(status_code=401, content={"success": False, "detail": "Invalid credentials"})
+        if not user:
+            return JSONResponse(
+                status_code=401,
+                content={"success": False, "detail": "Invalid credentials"}
+            )
+
+        role_val = user.role.value if hasattr(user.role, 'value') else str(user.role)
+        token = create_access_token({"sub": str(user.staff_id), "role": role_val})
+
+        return {
+            "success": True,
+            "access_token": token,
+            "token_type": "bearer",
+            "role": role_val,
+            "username": user.name,
+            "staff_id": user.staff_id
+        }
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return JSONResponse(status_code=400, content={"success": False, "detail": "Invalid request format"})
+        print("ERROR in login:", traceback.format_exc())
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "detail": "Invalid request format"}
+        )
+
 # --------------------------------------------------
 # DOCTOR DASHBOARD SUPPORT ROUTES
 # --------------------------------------------------
-
 @app.get("/api/doctors/current", tags=["doctors"])
 async def get_current_doctor(db: Session = Depends(get_db)):
     doctor = db.query(Staff).filter(Staff.role == StaffRole.DOCTOR).first()
@@ -207,7 +248,6 @@ async def get_waiting_patients_list(doctor_id: str, db: Session = Depends(get_db
 # --------------------------------------------------
 # PRESCRIPTION ROUTES
 # --------------------------------------------------
-
 @app.get("/api/prescriptions", tags=["patients"])
 async def list_prescriptions(patient_id: Optional[int] = None, db: Session = Depends(get_db)):
     query = db.query(Prescription)
@@ -237,7 +277,6 @@ async def create_prescription(data: Dict[str, Any], db: Session = Depends(get_db
 # --------------------------------------------------
 # QUEUE ROUTES
 # --------------------------------------------------
-
 @app.get("/api/queue/status", tags=["queue"])
 async def get_queue_status(db: Session = Depends(get_db)):
     stats = QueueManager.get_queue_stats(db)
@@ -245,10 +284,10 @@ async def get_queue_status(db: Session = Depends(get_db)):
 
 @app.post("/api/queue/register", tags=["queue"])
 async def register_patient_queue(
-    patient_id: int, 
-    department: str = "General", 
-    condition: str = None, 
-    priority: int = 1, 
+    patient_id: int,
+    department: str = "General",
+    condition: str = None,
+    priority: int = 1,
     doctor_id: str = "DOC001",
     db: Session = Depends(get_db)
 ):
@@ -264,13 +303,9 @@ async def call_next_patient(doctor_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail=result.get("error", "No patients in queue"))
     return result
 
-
-
-
 # --------------------------------------------------
 # PATIENT ROUTES
 # --------------------------------------------------
-
 @app.get("/api/patients", tags=["patients"])
 async def list_patients(search: Optional[str] = None, db: Session = Depends(get_db)):
     patients = PatientService.get_patients(db, search=search)
@@ -289,14 +324,223 @@ async def get_patient(patient_id: int, db: Session = Depends(get_db)):
     return {"success": True, "data": patient}
 
 # --------------------------------------------------
-# OTHER DASHBOARD ROUTES
+# ADMIN ROUTES
 # --------------------------------------------------
-
 @app.get("/api/admin/dashboard", tags=["admin"])
-async def admin_dashboard(current_user = Depends(require_role(["admin"])), db: Session = Depends(get_db)):
+async def admin_dashboard(
+    current_user = Depends(require_role(["admin"])),
+    db: Session = Depends(get_db)
+):
     stats = AdminService.get_dashboard_stats(db)
     return {"success": True, "data": stats}
 
+@app.get("/api/admin/staff", tags=["admin"])
+async def get_all_staff_list(
+    role: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user = Depends(require_role(["admin"]))
+):
+    """
+    Get all staff members. Optionally filter by role.
+    Returns a list under 'data' key.
+    """
+    staff_members = AdminModel.get_all_staff(role=role, db=db)
+    return {"success": True, "data": staff_members or []}
+
+@app.post("/api/admin/staff", tags=["admin"])
+async def add_new_staff(
+    staff_data: StaffCreate,
+    db: Session = Depends(get_db),
+    current_user = Depends(require_role(["admin"]))
+):
+    """Create a new staff member (Doctor, Nurse, etc.)"""
+    try:
+        new_staff = AdminModel.create_staff(staff_data, db)
+        return {"success": True, "data": new_staff}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/api/admin/staff/{staff_id}", tags=["admin"])
+async def remove_staff(
+    staff_id: int,
+    db: Session = Depends(get_db),
+    current_user = Depends(require_role(["admin"]))
+):
+    """Deactivate a staff member"""
+    success = AdminModel.delete_staff(staff_id, db)
+    if not success:
+        raise HTTPException(status_code=404, detail="Staff member not found")
+    return {"success": True, "message": "Staff deactivated"}
+
+# ===== CONSULTATION RECORDS (FILTERED) =====
+@app.get("/api/admin/consultations", tags=["admin"])
+async def get_filtered_consultations(
+    department: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    status: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user = Depends(require_role(["admin"]))
+):
+    """Return filtered consultation records with summary statistics."""
+    query = db.query(Consultation).join(Patient, Consultation.patient_id == Patient.id)
+
+    if department:
+        query = query.filter(Consultation.department == department)
+    if status:
+        query = query.filter(Consultation.status == status)
+    if from_date:
+        from_dt = datetime.fromisoformat(from_date)
+        query = query.filter(Consultation.created_at >= from_dt)
+    if to_date:
+        to_dt = datetime.fromisoformat(to_date) + timedelta(days=1)
+        query = query.filter(Consultation.created_at < to_dt)
+
+    consultations = query.all()
+
+    records = []
+    for c in consultations:
+        patient = db.query(Patient).filter(Patient.id == c.patient_id).first()
+        doctor = db.query(Staff).filter(Staff.staff_id == c.doctor_id).first() if c.doctor_id else None
+        records.append({
+            "id": c.id,
+            "patient_name": patient.name if patient else "Unknown",
+            "doctor_name": doctor.name if doctor else "Unknown",
+            "department": c.department,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+            "status": c.status,
+            "condition": c.condition,
+            "priority": c.priority,
+        })
+
+    total_patients = db.query(Patient).count()
+    total_consultations = len(consultations)
+    wait_times = []
+    for c in consultations:
+        if c.started_at and c.created_at:
+            wait = (c.started_at - c.created_at).seconds // 60
+            if wait > 0:
+                wait_times.append(wait)
+    avg_wait_time = sum(wait_times) // len(wait_times) if wait_times else 0
+
+    treated_today = db.query(Consultation).filter(
+        Consultation.status == "treated",
+        Consultation.completed_at >= datetime.now().replace(hour=0, minute=0, second=0)
+    ).count()
+
+    stats = {
+        "totalPatients": total_patients,
+        "totalConsultations": total_consultations,
+        "avgWaitTime": avg_wait_time,
+        "treatedToday": treated_today,
+    }
+
+    return {"records": records, "stats": stats}
+
+
+# ===== EXPORT REPORT (CONSULTATIONS) =====
+@app.options("/api/admin/reports/export", tags=["admin"])
+async def export_report_options():
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "http://localhost:3000",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "Authorization, Content-Type",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Max-Age": "86400",
+        }
+    )
+
+
+@app.get("/api/admin/reports/export", tags=["admin"])
+async def export_report(
+    format: str = "pdf",
+    department: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    status: Optional[str] = None,
+    include_charts: bool = False,
+    db: Session = Depends(get_db),
+    current_user = Depends(require_role(["admin"]))
+):
+    """Export filtered consultations as PDF or Excel, optionally with charts."""
+    try:
+        file_content, media_type, filename = await AdminService.generate_report(
+            format, department, from_date, to_date, status, include_charts, db
+        )
+        return Response(
+            content=file_content,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Access-Control-Allow-Origin": "http://localhost:3000",
+                "Access-Control-Allow-Credentials": "true",
+                "Access-Control-Expose-Headers": "Content-Disposition",
+            }
+        )
+    except Exception as e:
+        print("ERROR in export_report:", traceback.format_exc())
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "detail": str(e)},
+            headers={
+                "Access-Control-Allow-Origin": "http://localhost:3000",
+                "Access-Control-Allow-Credentials": "true",
+            }
+        )
+
+# ===== PERSONNEL EXPORT (STAFF & PATIENTS) =====
+@app.options("/api/admin/personnel/export", tags=["admin"])
+async def personnel_export_options():
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "http://localhost:3000",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "Authorization, Content-Type",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Max-Age": "86400",
+        }
+    )
+
+
+@app.get("/api/admin/personnel/export", tags=["admin"])
+async def export_personnel_report(
+    format: str = "pdf",
+    include_charts: bool = False,
+    db: Session = Depends(get_db),
+    current_user = Depends(require_role(["admin"]))
+):
+    """Export staff and patients lists as PDF or Excel, optionally with charts."""
+    try:
+        file_content, media_type, filename = await AdminService.generate_personnel_report(
+            format, db, include_charts
+        )
+        return Response(
+            content=file_content,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Access-Control-Allow-Origin": "http://localhost:3000",
+                "Access-Control-Allow-Credentials": "true",
+                "Access-Control-Expose-Headers": "Content-Disposition",
+            }
+        )
+    except Exception as e:
+        print("ERROR in personnel export:", traceback.format_exc())
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "detail": str(e)},
+            headers={
+                "Access-Control-Allow-Origin": "http://localhost:3000",
+                "Access-Control-Allow-Credentials": "true",
+            }
+        )
+
+# --------------------------------------------------
+# RECEPTIONIST ROUTES
+# --------------------------------------------------
 @app.get("/api/receptionist/dashboard", tags=["receptionist"])
 async def get_receptionist_dashboard(db: Session = Depends(get_db)):
     result = ReceptionistService.get_dashboard_stats(db)
@@ -332,7 +576,7 @@ async def quick_register_patient(data: QuickRegistration, db: Session = Depends(
         p_no = PatientModel.generate_patient_number(db)
         new_patient = Patient(name=data.patient_name, phone=data.phone, patient_number=p_no)
         db.add(new_patient)
-        db.flush() 
+        db.flush()
 
         new_consultation = Consultation(
             patient_id=new_patient.id,
@@ -348,53 +592,13 @@ async def quick_register_patient(data: QuickRegistration, db: Session = Depends(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
-        
 
-# --- STAFF MANAGEMENT ROUTES ---
-
-@app.get("/api/admin/staff", tags=["admin"])
-async def get_all_staff_list(
-    role: Optional[str] = None, 
-    db: Session = Depends(get_db),
-    current_user = Depends(require_role(["admin"])) # Protect this route!
-):
-    """Fetch all staff members for the Admin Dashboard"""
-    staff_members = AdminModel.get_all_staff(role=role, db=db)
-    return {"success": True, "data": staff_members}
-
-@app.post("/api/admin/staff", tags=["admin"])
-async def add_new_staff(
-    staff_data: StaffCreate, 
-    db: Session = Depends(get_db),
-    current_user = Depends(require_role(["admin"]))
-):
-    """Create a new staff member (Doctor, Nurse, etc.)"""
-    try:
-        new_staff = AdminModel.create_staff(staff_data, db)
-        return {"success": True, "data": new_staff}
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.delete("/api/admin/staff/{staff_id}", tags=["admin"])
-async def remove_staff(
-    staff_id: int, 
-    db: Session = Depends(get_db),
-    current_user = Depends(require_role(["admin"]))
-):
-    """Deactivate a staff member"""
-    success = AdminModel.delete_staff(staff_id, db)
-    if not success:
-        raise HTTPException(status_code=404, detail="Staff member not found")
-    return {"success": True, "message": "Staff deactivated"}
-
-
-# other routes 
-
+# --------------------------------------------------
+# NOTIFICATIONS ROUTE (Mock)
+# --------------------------------------------------
 @app.get("/api/notifications", tags=["notifications"])
 async def get_notifications(db: Session = Depends(get_db)):
     """Fetches system notifications for the logged-in user"""
-    # For now, we return a mock notification to stop the 404
-    # Later, you can link this to a 'Notifications' table in your DB
     return {
         "success": True,
         "data": [
@@ -407,10 +611,10 @@ async def get_notifications(db: Session = Depends(get_db)):
             }
         ]
     }
+
 # --------------------------------------------------
 # HEALTH & SYSTEM
 # --------------------------------------------------
-
 @app.get("/", tags=["health"])
 async def root():
     return {
@@ -431,7 +635,7 @@ async def health_check(db: Session = Depends(get_db)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("src.main:app", host="0.0.0.0", port=8000, reload=True) 
+    uvicorn.run("src.main:app", host="0.0.0.0", port=8000, reload=True)
 """
 ====================================================================================================
 MASHAR HOSPITAL API - COMPLETE ROUTES & LOGIN CREDENTIALS
