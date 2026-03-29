@@ -356,9 +356,27 @@ async def add_new_staff(
     """Create a new staff member (Doctor, Nurse, etc.)"""
     try:
         new_staff = AdminModel.create_staff(staff_data, db)
-        return {"success": True, "data": new_staff}
+        return {"success": True, "data": new_staff, "message": f"Staff {staff_data.name} created successfully"}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+# ===== NEW: PUT endpoint for updating staff =====
+@app.put("/api/admin/staff/{staff_id}", tags=["admin"])
+async def update_staff(
+    staff_id: int,
+    staff_update: StaffUpdate,
+    db: Session = Depends(get_db),
+    current_user = Depends(require_role(["admin"]))
+):
+    """Update an existing staff member."""
+    try:
+        updated_staff = AdminModel.update_staff(staff_id, staff_update, db)
+        if not updated_staff:
+            raise HTTPException(status_code=404, detail="Staff member not found")
+        return {"success": True, "data": updated_staff, "message": "Staff updated successfully"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+# ===================================================
 
 @app.delete("/api/admin/staff/{staff_id}", tags=["admin"])
 async def remove_staff(
@@ -366,7 +384,7 @@ async def remove_staff(
     db: Session = Depends(get_db),
     current_user = Depends(require_role(["admin"]))
 ):
-    """Deactivate a staff member"""
+    """Deactivate a staff member (soft delete)."""
     success = AdminModel.delete_staff(staff_id, db)
     if not success:
         raise HTTPException(status_code=404, detail="Staff member not found")
