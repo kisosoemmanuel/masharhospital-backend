@@ -87,12 +87,12 @@ class Prescription(Base):
     patient_id = Column(Integer, ForeignKey("patients.id"))
     doctor_id = Column(Integer)
     medication = Column(String)
+    diagnosis = Column(String, nullable=True)
     dosage = Column(String)
     instructions = Column(String)
     is_filled = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.now)
 
-    # Relationships
     patient = relationship("Patient", back_populates="prescriptions")
 
 
