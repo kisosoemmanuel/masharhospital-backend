@@ -42,6 +42,7 @@ class Patient(Base):
     name = Column(String, nullable=False)
     age = Column(Integer)
     gender = Column(String)
+    status = Column(String, default="active")
     phone = Column(String, index=True)
     email = Column(String)
     address = Column(String)
@@ -136,6 +137,8 @@ class QuickRegistration(BaseModel):
     condition: str
     priority: int = 1
     department: str = "General"
+    age: Optional[int] = Field(None, ge=0, le=120)   # new
+    gender: Optional[str] = None                     # new
 
 # -----------------------------
 # Service Helper (Data Access)
