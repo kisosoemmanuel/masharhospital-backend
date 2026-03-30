@@ -47,7 +47,10 @@ load_dotenv()
 
 SECRET_KEY = os.getenv("SECRET_KEY", "change-this-secret-in-production")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# ✅ FIX 1: Increased token expiry from 30 min to 8 hours so doctors don't get
+# logged out mid-shift. Change back to 30 if you want stricter security.
+ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 hours
 
 # --------------------------------------------------
 # DATABASE & LIFESPAN
@@ -118,6 +121,17 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode.update({"exp": expire, "iat": datetime.utcnow()})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+# ✅ FIX 2: Normalize role to lowercase so "Doctor", "DOCTOR", "doctor" all match
+def normalize_role(role_value: Any) -> str:
+    """Convert any role representation to a clean lowercase string."""
+    if role_value is None:
+        return ""
+    raw = role_value.value if hasattr(role_value, 'value') else str(role_value)
+    # Handle cases like "StaffRole.doctor" -> "doctor"
+    if "." in raw:
+        raw = raw.split(".")[-1]
+    return raw.strip().lower()
+
 async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     if not token:
         raise HTTPException(status_code=401, detail="Authentication required")
@@ -127,13 +141,20 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         role = payload.get("role")
         if not username or not role:
             raise HTTPException(status_code=401, detail="Invalid token claims")
-        return {"username": username, "role": role}
-    except JWTError:
+        # Normalize role from token too
+        normalized_role = normalize_role(role)
+        print(f"🔐 Token decoded: user={username}, role={normalized_role}")
+        return {"username": username, "role": normalized_role}
+    except JWTError as e:
+        print(f"JWT Error: {e}")
         raise HTTPException(status_code=401, detail="Invalid token")
 
 def require_role(required_roles: List[str]):
-    async def role_checker(current_user = Depends(get_current_user)):
-        if current_user["role"] not in required_roles:
+    # ✅ FIX 3: Normalize required_roles to lowercase for consistent comparison
+    normalized_required = [r.lower() for r in required_roles]
+    async def role_checker(current_user=Depends(get_current_user)):
+        if current_user["role"] not in normalized_required:
+            print(f"⛔ Role mismatch: user has '{current_user['role']}', needs one of {normalized_required}")
             raise HTTPException(status_code=403, detail="Insufficient permissions")
         return current_user
     return role_checker
@@ -167,22 +188,17 @@ async def universal_login(
         body = await request.json()
         print(f"DEBUG: Login attempt payload: {body}")
 
-        # Normalize: try to parse into our model
         try:
             login_data = UniversalLoginRequest(**body)
-        except ValidationError as e:
-            # If validation fails, maybe the frontend sent nested data (e.g., { employee_id: { username: ... } })
-            # Flatten by extracting any dict value
+        except ValidationError:
             flat_body = {}
             for key, value in body.items():
                 if isinstance(value, dict):
-                    # Merge nested dict into flat (e.g., employee_id dict)
                     flat_body.update(value)
                 else:
                     flat_body[key] = value
             login_data = UniversalLoginRequest(**flat_body)
 
-        # Determine the identifier
         identifier = login_data.username or login_data.staff_id or login_data.employee_id
         if not identifier or not login_data.password:
             return JSONResponse(
@@ -190,7 +206,6 @@ async def universal_login(
                 content={"success": False, "detail": "Username and password required"}
             )
 
-        # Authenticate against staff table (handles all roles)
         user = AdminModel.authenticate(db, staff_id=str(identifier), password=str(login_data.password))
 
         if not user:
@@ -199,8 +214,11 @@ async def universal_login(
                 content={"success": False, "detail": "Invalid credentials"}
             )
 
-        role_val = user.role.value if hasattr(user.role, 'value') else str(user.role)
+        # ✅ FIX 4: Always store role as normalized lowercase in the token
+        role_val = normalize_role(user.role)
         token = create_access_token({"sub": str(user.staff_id), "role": role_val})
+
+        print(f"✅ Login success: {user.staff_id}, role stored in token: '{role_val}'")
 
         return {
             "success": True,
@@ -208,7 +226,13 @@ async def universal_login(
             "token_type": "bearer",
             "role": role_val,
             "username": user.name,
-            "staff_id": user.staff_id
+            "staff_id": user.staff_id,
+            "user": {
+                "id": user.id,
+                "name": user.name,
+                "staff_id": user.staff_id,
+                "role": role_val,
+            }
         }
 
     except Exception as e:
@@ -221,6 +245,30 @@ async def universal_login(
 # --------------------------------------------------
 # DOCTOR DASHBOARD SUPPORT ROUTES
 # --------------------------------------------------
+@app.get("/api/doctors/patients/{patient_id}/consultations", tags=["doctors"])
+async def get_patient_consultations_for_doctor(
+    patient_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_role(["doctor", "admin"]))
+):
+    """Return all consultations for a patient (doctor or admin accessible)."""
+    consultations = db.query(Consultation).filter(Consultation.patient_id == patient_id).all()
+    return {
+        "success": True,
+        "data": [
+            {
+                "id": c.id,
+                "condition": c.condition,
+                "status": c.status,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+                "department": c.department,
+                "priority": c.priority,
+                "doctor_id": c.doctor_id,
+            }
+            for c in consultations
+        ]
+    }
+
 @app.get("/api/doctors/current", tags=["doctors"])
 async def get_current_doctor(db: Session = Depends(get_db)):
     doctor = db.query(Staff).filter(Staff.role == StaffRole.DOCTOR).first()
@@ -245,6 +293,36 @@ async def get_waiting_patients_list(doctor_id: str, db: Session = Depends(get_db
     patients = QueueManager.get_waiting_by_doctor(db, doctor_id)
     return {"success": True, "data": patients}
 
+@app.put("/api/consultations/{consultation_id}/status", tags=["queue"])
+async def update_consultation_status(
+    consultation_id: int,
+    status: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_role(["doctor", "admin"]))
+):
+    consultation = db.query(Consultation).filter(Consultation.id == consultation_id).first()
+    if not consultation:
+        raise HTTPException(status_code=404, detail="Consultation not found")
+    consultation.status = status
+    if status == "treated":
+        consultation.completed_at = datetime.utcnow()
+    db.commit()
+    return {"success": True, "message": f"Consultation status updated to {status}"}
+
+# ✅ FIX 5: Added a /api/debug/role endpoint so you can test what role your token has
+@app.get("/api/debug/role", tags=["debug"])
+async def debug_role(current_user=Depends(get_current_user)):
+    """Call this from the browser console to check your token's role."""
+    return {
+        "username": current_user["username"],
+        "role": current_user["role"],
+        "message": f"Your token identifies you as role='{current_user['role']}'"
+    }
+
+@app.get("/api/debug/token", tags=["debug"])
+async def debug_token(current_user=Depends(require_role(["doctor", "admin"]))):
+    return {"user": current_user}
+
 # --------------------------------------------------
 # PRESCRIPTION ROUTES
 # --------------------------------------------------
@@ -261,10 +339,12 @@ async def create_prescription(data: Dict[str, Any], db: Session = Depends(get_db
     try:
         new_presc = Prescription(
             patient_id=data.get("patient_id"),
-            doctor_id=str(data.get("doctor_id")),
-            medications=json.dumps(data.get("medications", [])),
-            diagnosis=data.get("diagnosis"),
-            instructions=data.get("instructions")
+            doctor_id=data.get("doctor_id"),
+            medication=data.get("medication"), 
+            dosage=data.get("dosage"),
+            diagnosis=data.get("diagnosis"), 
+            instructions=data.get("instructions"),
+            prescription_number=f"PRE-{datetime.now().strftime('%Y%m%d%H%M%S')}"
         )
         db.add(new_presc)
         db.commit()
@@ -272,6 +352,7 @@ async def create_prescription(data: Dict[str, Any], db: Session = Depends(get_db
         return {"success": True, "data": new_presc}
     except Exception as e:
         db.rollback()
+        # This will now show you if there's any remaining database mismatch
         raise HTTPException(status_code=400, detail=str(e))
 
 # --------------------------------------------------
@@ -323,12 +404,17 @@ async def get_patient(patient_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Patient not found")
     return {"success": True, "data": patient}
 
+@app.get("/api/patients/search/{query}", tags=["patients"])
+async def search_patients(query: str, db: Session = Depends(get_db)):
+    patients = PatientService.get_patients(db, search=query)
+    return {"success": True, "data": patients, "count": len(patients)}
+
 # --------------------------------------------------
 # ADMIN ROUTES
 # --------------------------------------------------
 @app.get("/api/admin/dashboard", tags=["admin"])
 async def admin_dashboard(
-    current_user = Depends(require_role(["admin"])),
+    current_user=Depends(require_role(["admin"])),
     db: Session = Depends(get_db)
 ):
     stats = AdminService.get_dashboard_stats(db)
@@ -338,12 +424,8 @@ async def admin_dashboard(
 async def get_all_staff_list(
     role: Optional[str] = None,
     db: Session = Depends(get_db),
-    current_user = Depends(require_role(["admin"]))
+    current_user=Depends(require_role(["admin"]))
 ):
-    """
-    Get all staff members. Optionally filter by role.
-    Returns a list under 'data' key.
-    """
     staff_members = AdminModel.get_all_staff(role=role, db=db)
     return {"success": True, "data": staff_members or []}
 
@@ -351,9 +433,8 @@ async def get_all_staff_list(
 async def add_new_staff(
     staff_data: StaffCreate,
     db: Session = Depends(get_db),
-    current_user = Depends(require_role(["admin"]))
+    current_user=Depends(require_role(["admin"]))
 ):
-    """Create a new staff member (Doctor, Nurse, etc.)"""
     try:
         new_staff = AdminModel.create_staff(staff_data, db)
         return {"success": True, "data": new_staff, "message": f"Staff {staff_data.name} created successfully"}
@@ -376,13 +457,12 @@ async def update_staff(
         return {"success": True, "data": updated_staff, "message": "Staff updated successfully"}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-# ===================================================
 
 @app.delete("/api/admin/staff/{staff_id}", tags=["admin"])
 async def remove_staff(
     staff_id: int,
     db: Session = Depends(get_db),
-    current_user = Depends(require_role(["admin"]))
+    current_user=Depends(require_role(["admin"]))
 ):
     """Deactivate a staff member (soft delete)."""
     success = AdminModel.delete_staff(staff_id, db)
@@ -390,7 +470,6 @@ async def remove_staff(
         raise HTTPException(status_code=404, detail="Staff member not found")
     return {"success": True, "message": "Staff deactivated"}
 
-# ===== CONSULTATION RECORDS (FILTERED) =====
 @app.get("/api/admin/consultations", tags=["admin"])
 async def get_filtered_consultations(
     department: Optional[str] = None,
@@ -398,11 +477,9 @@ async def get_filtered_consultations(
     to_date: Optional[str] = None,
     status: Optional[str] = None,
     db: Session = Depends(get_db),
-    current_user = Depends(require_role(["admin"]))
+    current_user=Depends(require_role(["admin"]))
 ):
-    """Return filtered consultation records with summary statistics."""
     query = db.query(Consultation).join(Patient, Consultation.patient_id == Patient.id)
-
     if department:
         query = query.filter(Consultation.department == department)
     if status:
@@ -415,7 +492,6 @@ async def get_filtered_consultations(
         query = query.filter(Consultation.created_at < to_dt)
 
     consultations = query.all()
-
     records = []
     for c in consultations:
         patient = db.query(Patient).filter(Patient.id == c.patient_id).first()
@@ -440,36 +516,30 @@ async def get_filtered_consultations(
             if wait > 0:
                 wait_times.append(wait)
     avg_wait_time = sum(wait_times) // len(wait_times) if wait_times else 0
-
     treated_today = db.query(Consultation).filter(
         Consultation.status == "treated",
         Consultation.completed_at >= datetime.now().replace(hour=0, minute=0, second=0)
     ).count()
 
-    stats = {
-        "totalPatients": total_patients,
-        "totalConsultations": total_consultations,
-        "avgWaitTime": avg_wait_time,
-        "treatedToday": treated_today,
+    return {
+        "records": records,
+        "stats": {
+            "totalPatients": total_patients,
+            "totalConsultations": total_consultations,
+            "avgWaitTime": avg_wait_time,
+            "treatedToday": treated_today,
+        }
     }
 
-    return {"records": records, "stats": stats}
-
-
-# ===== EXPORT REPORT (CONSULTATIONS) =====
 @app.options("/api/admin/reports/export", tags=["admin"])
 async def export_report_options():
-    return Response(
-        status_code=200,
-        headers={
-            "Access-Control-Allow-Origin": "http://localhost:3000",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "Authorization, Content-Type",
-            "Access-Control-Allow-Credentials": "true",
-            "Access-Control-Max-Age": "86400",
-        }
-    )
-
+    return Response(status_code=200, headers={
+        "Access-Control-Allow-Origin": "http://localhost:3000",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type",
+        "Access-Control-Allow-Credentials": "true",
+        "Access-Control-Max-Age": "86400",
+    })
 
 @app.get("/api/admin/reports/export", tags=["admin"])
 async def export_report(
@@ -480,9 +550,8 @@ async def export_report(
     status: Optional[str] = None,
     include_charts: bool = False,
     db: Session = Depends(get_db),
-    current_user = Depends(require_role(["admin"]))
+    current_user=Depends(require_role(["admin"]))
 ):
-    """Export filtered consultations as PDF or Excel, optionally with charts."""
     try:
         file_content, media_type, filename = await AdminService.generate_report(
             format, department, from_date, to_date, status, include_charts, db
@@ -499,42 +568,28 @@ async def export_report(
         )
     except Exception as e:
         print("ERROR in export_report:", traceback.format_exc())
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "detail": str(e)},
-            headers={
-                "Access-Control-Allow-Origin": "http://localhost:3000",
-                "Access-Control-Allow-Credentials": "true",
-            }
-        )
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)},
+            headers={"Access-Control-Allow-Origin": "http://localhost:3000", "Access-Control-Allow-Credentials": "true"})
 
-# ===== PERSONNEL EXPORT (STAFF & PATIENTS) =====
 @app.options("/api/admin/personnel/export", tags=["admin"])
 async def personnel_export_options():
-    return Response(
-        status_code=200,
-        headers={
-            "Access-Control-Allow-Origin": "http://localhost:3000",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "Authorization, Content-Type",
-            "Access-Control-Allow-Credentials": "true",
-            "Access-Control-Max-Age": "86400",
-        }
-    )
-
+    return Response(status_code=200, headers={
+        "Access-Control-Allow-Origin": "http://localhost:3000",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type",
+        "Access-Control-Allow-Credentials": "true",
+        "Access-Control-Max-Age": "86400",
+    })
 
 @app.get("/api/admin/personnel/export", tags=["admin"])
 async def export_personnel_report(
     format: str = "pdf",
     include_charts: bool = False,
     db: Session = Depends(get_db),
-    current_user = Depends(require_role(["admin"]))
+    current_user=Depends(require_role(["admin"]))
 ):
-    """Export staff and patients lists as PDF or Excel, optionally with charts."""
     try:
-        file_content, media_type, filename = await AdminService.generate_personnel_report(
-            format, db, include_charts
-        )
+        file_content, media_type, filename = await AdminService.generate_personnel_report(format, db, include_charts)
         return Response(
             content=file_content,
             media_type=media_type,
@@ -547,14 +602,8 @@ async def export_personnel_report(
         )
     except Exception as e:
         print("ERROR in personnel export:", traceback.format_exc())
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "detail": str(e)},
-            headers={
-                "Access-Control-Allow-Origin": "http://localhost:3000",
-                "Access-Control-Allow-Credentials": "true",
-            }
-        )
+        return JSONResponse(status_code=500, content={"success": False, "detail": str(e)},
+            headers={"Access-Control-Allow-Origin": "http://localhost:3000", "Access-Control-Allow-Credentials": "true"})
 
 # --------------------------------------------------
 # RECEPTIONIST ROUTES
@@ -566,7 +615,6 @@ async def get_receptionist_dashboard(db: Session = Depends(get_db)):
 
 @app.get("/api/receptionist/queue", tags=["receptionist"])
 async def get_receptionist_queue(db: Session = Depends(get_db)):
-    """Join Consultation + Patient to show name and status together"""
     queue_data = (
         db.query(Consultation, Patient)
         .join(Patient, Consultation.patient_id == Patient.id)
@@ -589,13 +637,11 @@ async def get_receptionist_queue(db: Session = Depends(get_db)):
 
 @app.post("/api/receptionist/patients/quick", tags=["receptionist"])
 async def quick_register_patient(data: QuickRegistration, db: Session = Depends(get_db)):
-    """Atomic: Create Patient -> Flush ID -> Create Consultation"""
     try:
         p_no = PatientModel.generate_patient_number(db)
         new_patient = Patient(name=data.patient_name, phone=data.phone, patient_number=p_no)
         db.add(new_patient)
         db.flush()
-
         new_consultation = Consultation(
             patient_id=new_patient.id,
             condition=data.condition,
@@ -612,11 +658,10 @@ async def quick_register_patient(data: QuickRegistration, db: Session = Depends(
         raise HTTPException(status_code=500, detail=str(e))
 
 # --------------------------------------------------
-# NOTIFICATIONS ROUTE (Mock)
+# NOTIFICATIONS ROUTE
 # --------------------------------------------------
 @app.get("/api/notifications", tags=["notifications"])
 async def get_notifications(db: Session = Depends(get_db)):
-    """Fetches system notifications for the logged-in user"""
     return {
         "success": True,
         "data": [
@@ -635,325 +680,14 @@ async def get_notifications(db: Session = Depends(get_db)):
 # --------------------------------------------------
 @app.get("/", tags=["health"])
 async def root():
-    return {
-        "message": "Mashar Hospital API v2.1",
-        "docs": "/docs",
-        "health": "/api/health"
-    }
+    return {"message": "Mashar Hospital API v2.1", "docs": "/docs", "health": "/api/health"}
 
 @app.get("/api/health", tags=["health"])
 async def health_check(db: Session = Depends(get_db)):
     stats = QueueManager.get_queue_stats(db)
-    return {
-        "success": True,
-        "status": "healthy",
-        "version": "2.1.0",
-        "queue": stats
-    }
+    return {"success": True, "status": "healthy", "version": "2.1.0", "queue": stats}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("src.main:app", host="0.0.0.0", port=8000, reload=True)
-"""
-====================================================================================================
-MASHAR HOSPITAL API - COMPLETE ROUTES & LOGIN CREDENTIALS
-====================================================================================================
+    uvicorn.run("src.main:app", host="0.0.0.0", port=8000, reload=True) 
 
-BASE URL: http://localhost:8000 | DOCS: http://localhost:8000/docs | REDOC: http://localhost:8000/redoc
-
-----------------------------------------------------------------------------------------------------
-🚀 NEW: UNIVERSAL LOGIN (Works for all user types - Role Auto-Detection)
-----------------------------------------------------------------------------------------------------
-POST /api/login
-Content-Type: application/json
-
-{
-    "username": "A001",     # Can be username, staff_id, or employee_id
-    "password": "admin123",
-    "role": "admin"          # Optional - system auto-detects if not provided
-}
-
-----------------------------------------------------------------------------------------------------
-LOGIN CREDENTIALS (Default Users)
-----------------------------------------------------------------------------------------------------
-
-┌──────────────┬─────────────┬─────────────────┬─────────────────┬─────────────────┐
-│ Role         │ Username/ID │ Password        │ Name            │ Department      │
-├──────────────┼─────────────┼─────────────────┼─────────────────┼─────────────────┤
-│ Admin        │ A001        │ admin123        │ Admin User      │ Administration  │
-│ Doctor       │ D001        │ doctor123       │ Dr. John Kamau  │ Cardiology      │
-│ Receptionist │ R001        │ receptionist123 │ Mary Wanjiku    │ Front Desk      │
-│ Nurse        │ N001        │ nurse123        │ Nurse Sarah     │ General Ward    │
-└──────────────┴─────────────┴─────────────────┴─────────────────┴─────────────────┘
-
-----------------------------------------------------------------------------------------------------
-🔐 ROLE-SPECIFIC LOGIN ENDPOINTS
-----------------------------------------------------------------------------------------------------
-
-┌─────────────────────┬────────────────────────────────────────────────┐
-│ Endpoint            │ Description                                    │
-├─────────────────────┼────────────────────────────────────────────────┤
-│ POST /api/login     │ Universal login - auto-detects role            │
-│ POST /api/doctors/login │ Doctor-specific login                      │
-│ POST /api/admin/login    │ Admin-specific login                      │
-│ POST /api/receptionist/login │ Receptionist-specific login           │
-└─────────────────────┴────────────────────────────────────────────────┘
-
-Example Requests:
-
-1. Universal Login (Auto-detect):
-   curl -X POST http://localhost:8000/api/login \
-     -H "Content-Type: application/json" \
-     -d '{"username":"A001","password":"admin123"}'
-
-2. Doctor Login:
-   curl -X POST http://localhost:8000/api/doctors/login \
-     -H "Content-Type: application/json" \
-     -d '{"username":"D001","password":"doctor123"}'
-
-3. Admin Login:
-   curl -X POST http://localhost:8000/api/admin/login \
-     -H "Content-Type: application/json" \
-     -d '{"staff_id":"A001","password":"admin123"}'
-
-4. Receptionist Login:
-   curl -X POST http://localhost:8000/api/receptionist/login \
-     -H "Content-Type: application/json" \
-     -d '{"employee_id":"R001","password":"receptionist123"}'
-
-----------------------------------------------------------------------------------------------------
-🌐 PUBLIC ROUTES (No Authentication Required)
-----------------------------------------------------------------------------------------------------
-
-[ROOT & HEALTH]
-────────────────────────────────────────────────────────────────────────────────────
-GET    /                             - API root with links to documentation
-GET    /api/health                   - Health check endpoint with queue status
-
-[DOCTOR ROUTES]
-────────────────────────────────────────────────────────────────────────────────────
-POST   /api/doctors/login            - Authenticate doctor (returns JWT token)
-GET    /api/doctors                   - Get all doctors
-GET    /api/doctors/{doctor_id}       - Get specific doctor by ID
-
-[PATIENT ROUTES]
-────────────────────────────────────────────────────────────────────────────────────
-GET    /api/patients                  - Get all patients (filters: search, status)
-GET    /api/patients/{patient_id}     - Get specific patient by ID
-POST   /api/patients                  - Create new patient
-PUT    /api/patients/{patient_id}     - Update patient information
-
-[QUEUE ROUTES]
-────────────────────────────────────────────────────────────────────────────────────
-GET    /api/queue/current             - Get current consultation (filters: doctor_id, department)
-GET    /api/queue/waiting             - Get waiting patients (filters: doctor_id, department)
-POST   /api/queue/register             - Register patient to queue
-GET    /api/queue/status               - Get queue statistics
-
-[PRESCRIPTION ROUTES]
-────────────────────────────────────────────────────────────────────────────────────
-GET    /api/prescriptions              - Get prescriptions (filters: search, patient_id)
-POST   /api/prescriptions              - Create prescription
-
-----------------------------------------------------------------------------------------------------
-🛡️ PROTECTED ROUTES (Authentication Required)
-----------------------------------------------------------------------------------------------------
-
-[USER ROUTES - Any Authenticated User]
-────────────────────────────────────────────────────────────────────────────────────
-GET    /api/doctors/current            - Get currently logged-in user info
-
-[RECEPTIONIST ROUTES - Receptionist or Admin]
-────────────────────────────────────────────────────────────────────────────────────
-GET    /api/receptionist/dashboard          - Receptionist dashboard statistics
-POST   /api/receptionist/patients/quick     - Quick patient registration
-GET    /api/receptionist/queue              - Get patients in queue (filter: department)
-GET    /api/receptionists                   - Get all receptionists
-GET    /api/receptionists/active            - Get only active receptionists
-GET    /api/receptionists/{receptionist_id} - Get receptionist by database ID
-GET    /api/receptionists/employee/{employee_id} - Get receptionist by employee ID (R001)
-
-[QUEUE MANAGEMENT - Receptionist/Admin/Doctor]
-────────────────────────────────────────────────────────────────────────────────────
-GET    /api/queue/priority             - Get queue organized by priority (filter: department)
-POST   /api/queue/next/{doctor_id}     - Call next patient for a doctor
-
-[PATIENT SEARCH - Medical Staff (Doctor/Nurse/Admin)]
-────────────────────────────────────────────────────────────────────────────────────
-GET    /api/patients/search/{query}    - Search patients by name or phone
-
-[NOTIFICATION ROUTES - All Authenticated Users]
-────────────────────────────────────────────────────────────────────────────────────
-GET    /api/notifications               - Get notifications for current user's role
-GET    /api/notifications/unread/count  - Get count of unread notifications
-PUT    /api/notifications/{notification_id}/read - Mark notification as read
-PUT    /api/notifications/read-all      - Mark all notifications as read
-
-[PATIENT ROUTES - Admin Only]
-────────────────────────────────────────────────────────────────────────────────────
-DELETE /api/patients/{patient_id}       - Delete patient (Admin only)
-
-[RECEPTIONIST MANAGEMENT - Admin Only]
-────────────────────────────────────────────────────────────────────────────────────
-POST   /api/receptionists                - Create new receptionist
-PUT    /api/receptionists/{receptionist_id} - Update receptionist information
-DELETE /api/receptionists/{receptionist_id} - Delete/Deactivate receptionist
-
-----------------------------------------------------------------------------------------------------
-👑 ADMIN ONLY ROUTES
-----------------------------------------------------------------------------------------------------
-
-[ADMIN AUTHENTICATION]
-────────────────────────────────────────────────────────────────────────────────────
-POST   /api/admin/login                 - Admin-specific login endpoint
-
-[DASHBOARD]
-────────────────────────────────────────────────────────────────────────────────────
-GET    /api/admin/dashboard              - Complete admin dashboard with statistics
-
-[STAFF MANAGEMENT]
-────────────────────────────────────────────────────────────────────────────────────
-GET    /api/admin/staff                  - Get all staff members (filters: role, department)
-GET    /api/admin/staff/{staff_id}       - Get specific staff by database ID
-GET    /api/admin/staff/employee/{staff_id_str} - Get staff by employee ID (e.g., D001, A001)
-GET    /api/admin/staff/statistics       - Get staff statistics (counts by role, status)
-POST   /api/admin/staff                  - Create new staff member
-PUT    /api/admin/staff/{staff_id}       - Update staff information
-DELETE /api/admin/staff/{staff_id}       - Delete/deactivate staff member
-
-[BED MANAGEMENT]
-────────────────────────────────────────────────────────────────────────────────────
-GET    /api/admin/beds                   - Get all beds with occupancy status & statistics
-POST   /api/admin/beds/{bed_id}/assign   - Assign bed to patient (params: patient_id)
-POST   /api/admin/beds/{bed_id}/release  - Release bed from patient
-
-[INVENTORY MANAGEMENT]
-────────────────────────────────────────────────────────────────────────────────────
-GET    /api/admin/inventory              - Get all inventory items with status
-PUT    /api/admin/inventory/{item_id}    - Update inventory quantity (params: quantity_change)
-
-[ACTIVITY LOGS]
-────────────────────────────────────────────────────────────────────────────────────
-GET    /api/admin/activity-logs          - Get recent activity logs (limit: 20)
-
-[RECORDS & REPORTS]
-────────────────────────────────────────────────────────────────────────────────────
-GET    /api/admin/records                - Get all records (staff, beds, inventory, logs)
-GET    /api/admin/reports/monthly        - Generate monthly report with statistics
-
-----------------------------------------------------------------------------------------------------
-🔧 DEBUG ENDPOINTS (Development Only - Remove in Production)
-----------------------------------------------------------------------------------------------------
-
-POST   /api/debug/login                  - Debug login - shows what client is sending
-GET    /api/debug/users                   - List all available users in system
-
-----------------------------------------------------------------------------------------------------
-📊 SUMMARY
-----------------------------------------------------------------------------------------------------
-Total Routes: 60+
-├── Public Routes: 15
-├── Protected Routes: 40+
-│   ├── Any Authenticated User: 5
-│   ├── Receptionist/Admin: 10
-│   ├── Medical Staff (Doctor/Nurse/Admin): 5
-│   └── Admin Only: 25
-└── Debug Routes: 2
-
-----------------------------------------------------------------------------------------------------
-💡 USAGE EXAMPLES
-----------------------------------------------------------------------------------------------------
-
-1. UNIVERSAL LOGIN (Auto-detect role):
-   curl -X POST http://localhost:8000/api/login \
-     -H "Content-Type: application/json" \
-     -d '{"username":"A001","password":"admin123"}'
-
-2. LOGIN AS DOCTOR (with role):
-   curl -X POST http://localhost:8000/api/doctors/login \
-     -H "Content-Type: application/json" \
-     -d '{"username":"D001","password":"doctor123","role":"doctor"}'
-
-3. ACCESS ADMIN DASHBOARD (with token):
-   curl -X GET http://localhost:8000/api/admin/dashboard \
-     -H "Authorization: Bearer <your_token_here>"
-
-4. CREATE NEW DOCTOR (Admin only):
-   curl -X POST http://localhost:8000/api/admin/staff \
-     -H "Authorization: Bearer <token>" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "staff_id": "D002",
-       "name": "Dr. Jane Smith",
-       "role": "doctor",
-       "phone": "+254700111555",
-       "email": "jane.smith@hospital.com",
-       "department": "Pediatrics",
-       "specialization": "Pediatrician",
-       "password": "doctor456"
-     }'
-
-5. CREATE NEW RECEPTIONIST (Admin only):
-   curl -X POST http://localhost:8000/api/receptionists \
-     -H "Authorization: Bearer <token>" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "employee_id": "R003",
-       "name": "Alice Johnson",
-       "phone": "+254700111777",
-       "email": "alice@hospital.com",
-       "department": "Front Desk",
-       "password": "receptionist789"
-     }'
-
-6. QUICK REGISTER PATIENT (Receptionist):
-   curl -X POST http://localhost:8000/api/receptionist/patients/quick \
-     -H "Authorization: Bearer <token>" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "patient_name": "John Doe",
-       "phone": "+254722333444",
-       "age": 35,
-       "gender": "male",
-       "department": "Cardiology",
-       "condition": "Chest pain",
-       "priority": 2
-     }'
-
-7. GET QUEUE BY PRIORITY:
-   curl -X GET "http://localhost:8000/api/queue/priority?department=Cardiology" \
-     -H "Authorization: Bearer <token>"
-
-8. ASSIGN BED TO PATIENT (Admin):
-   curl -X POST http://localhost:8000/api/admin/beds/5/assign?patient_id=123 \
-     -H "Authorization: Bearer <token>"
-
-9. CHECK INVENTORY STATUS (Admin):
-   curl -X GET http://localhost:8000/api/admin/inventory \
-     -H "Authorization: Bearer <token>"
-
-10. VIEW ACTIVITY LOGS (Admin):
-    curl -X GET "http://localhost:8000/api/admin/activity-logs?limit=20" \
-      -H "Authorization: Bearer <token>"
-
-11. DEBUG - SEE ALL USERS:
-    curl -X GET http://localhost:8000/api/debug/users
-
-12. DEBUG - TEST LOGIN:
-    curl -X POST http://localhost:8000/api/debug/login \
-      -H "Content-Type: application/json" \
-      -d '{"username":"A001","password":"admin123"}'
-
-----------------------------------------------------------------------------------------------------
-📝 NOTES
-----------------------------------------------------------------------------------------------------
-- Role is now OPTIONAL in all login endpoints - system auto-detects
-- Username can be: username, staff_id, or employee_id depending on user type
-- All protected endpoints require Bearer token in Authorization header
-- Admin endpoints require user role = "admin"
-- Receptionist endpoints require user role = "receptionist" or "admin"
-- Medical staff endpoints require user role = "doctor", "nurse", or "admin"
-- Debug endpoints should be disabled in production
-- All timestamps are in ISO format
-- Default pagination limit is 50 items unless specified
-"""
