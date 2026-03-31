@@ -10,6 +10,7 @@ import traceback
 from dotenv import load_dotenv
 from jose import JWTError, jwt
 from pydantic import BaseModel, ValidationError, Field
+import httpx
 
 # Database Imports
 from sqlalchemy.orm import Session
@@ -895,6 +896,83 @@ async def get_notifications(
             for log in logs
         ],
     }
+
+
+# --------------------------------------------------
+# ✅ AI-POWERED MEDICATION SUGGESTION ENDPOINT
+# --------------------------------------------------
+
+@app.post("/api/ai/suggest-medication", tags=["doctors"])
+async def suggest_medication(request: Request):
+    try:
+        body = await request.json()
+        diagnosis = body.get("diagnosis", "").strip()
+
+        if not diagnosis:
+            raise HTTPException(status_code=400, detail="Diagnosis is required")
+
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured on server")
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 1000,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": f"""You are a clinical decision support assistant. Given a diagnosis, return medication suggestions as JSON only.
+
+Diagnosis: "{diagnosis}"
+
+Return ONLY a raw JSON array, no markdown, no explanation, no extra text. Example format:
+[
+  {{
+    "medication": "Amoxicillin",
+    "dosage": "500mg",
+    "frequency": "3x daily",
+    "duration": "7 days",
+    "instructions": "Take with food",
+    "note": "First-line antibiotic"
+  }}
+]"""
+                        }
+                    ],
+                },
+                timeout=30.0,
+            )
+
+        print(f"🤖 Anthropic status: {response.status_code}")
+
+        if response.status_code != 200:
+            print(f"🤖 Anthropic error: {response.text}")
+            return {"success": True, "suggestions": []}
+
+        data = response.json()
+        raw = data.get("content", [{}])[0].get("text", "[]")
+        print(f"🤖 Raw AI response: {raw}")
+
+        clean = raw.replace("```json", "").replace("```", "").strip()
+        suggestions = json.loads(clean)
+
+        return {"success": True, "suggestions": suggestions if isinstance(suggestions, list) else []}
+
+    except json.JSONDecodeError as e:
+        print(f"JSON parse error: {e}")
+        return {"success": True, "suggestions": []}
+    except Exception as e:
+        print(f"suggest_medication error: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) #functional AI intergration
+
+
 
 # --------------------------------------------------
 # HEALTH & SYSTEM
