@@ -970,7 +970,7 @@ Return ONLY a raw JSON array, no markdown, no explanation, no extra text. Exampl
         return {"success": True, "suggestions": []}
     except Exception as e:
         print(f"suggest_medication error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) #functional AI intergration
 
 
 
