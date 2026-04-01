@@ -719,6 +719,9 @@ async def list_patients(search: Optional[str] = None, db: Session = Depends(get_
             "name": p.name,
             "phone": p.phone,
             "gender": p.gender,
+            "age": p.age,
+            "status": p.status,
+            "patient_number": p.patient_number,
             "created_at": p.created_at,
             "condition": latest_consultation.condition if latest_consultation else None,
         })
@@ -919,6 +922,9 @@ async def export_report(
             media_type=media_type,
             headers={
                 "Content-Disposition": f"attachment; filename={filename}",
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
                 "Access-Control-Allow-Origin": "http://localhost:3000",
                 "Access-Control-Allow-Credentials": "true",
                 "Access-Control-Expose-Headers": "Content-Disposition",
@@ -961,6 +967,9 @@ async def export_personnel_report(
             media_type=media_type,
             headers={
                 "Content-Disposition": f"attachment; filename={filename}",
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
                 "Access-Control-Allow-Origin": "http://localhost:3000",
                 "Access-Control-Allow-Credentials": "true",
                 "Access-Control-Expose-Headers": "Content-Disposition",
@@ -999,7 +1008,7 @@ async def get_receptionist_queue(db: Session = Depends(get_db)):
             {
                 "id": c.id,
                 "name": p.name,
-                "phone": p.phone,          # Added phone
+                "phone": p.phone,
                 "condition": c.condition,
                 "priority": c.priority,
                 "status": c.status,
@@ -1019,9 +1028,9 @@ async def quick_register_patient(data: QuickRegistration, db: Session = Depends(
             name=data.patient_name,
             phone=data.phone,
             patient_number=p_no,
-            age=data.age,                # NEW
-            gender=data.gender,          # NEW
-            status="active"              # NEW – default status
+            age=data.age,
+            gender=data.gender,
+            status="active"
         )
         db.add(new_patient)
         db.flush()
@@ -1032,7 +1041,7 @@ async def quick_register_patient(data: QuickRegistration, db: Session = Depends(
             priority=data.priority,
             department=data.department,
             status="waiting",
-            doctor_id="DOC001",          # <-- ADDED: assign to the default doctor
+            doctor_id="DOC001",
             consultation_number=f"C-{datetime.now().strftime('%y%m%d%H%M%S')}",
         )
         db.add(new_consultation)
@@ -1060,7 +1069,7 @@ async def quick_register_patient(data: QuickRegistration, db: Session = Depends(
 async def get_notifications(
     limit: int = 20,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),   # any logged-in role can read
+    current_user=Depends(get_current_user),
 ):
     """Return recent activity logs as real-time notifications, newest first."""
     logs = (
@@ -1170,8 +1179,7 @@ Return ONLY a raw JSON array, no markdown, no explanation, no extra text. Exampl
         return {"success": True, "suggestions": []}
     except Exception as e:
         print(f"suggest_medication error: {e}")
-        raise HTTPException(status_code=500, detail=str(e)) #functional AI intergration
-
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # --------------------------------------------------

@@ -173,9 +173,11 @@ class AdminService:
         for c in consultations:
             patient = db.query(Patient).filter(Patient.id == c.patient_id).first()
             doctor = db.query(Staff).filter(Staff.staff_id == c.doctor_id).first() if c.doctor_id else None
+            # ✅ Added patient_age
             records.append({
                 "id": c.id,
                 "patient_name": patient.name if patient else "Unknown",
+                "patient_age": patient.age if patient else None,  # New field
                 "doctor_name": doctor.name if doctor else "Unknown",
                 "department": c.department,
                 "created_at": c.created_at.isoformat() if c.created_at else None,
@@ -216,11 +218,14 @@ class AdminService:
         elements.append(Paragraph("Mashar Hospital - Consultation Report", styles['Title']))
         elements.append(Spacer(1, 0.2 * inch))
 
-        data = [["Patient", "Doctor", "Department", "Date", "Status", "Condition"]]
+        # ✅ Added "Age" column
+        data = [["Patient", "Age", "Doctor", "Department", "Date", "Status", "Condition"]]
         for r in records:
             date_str = datetime.fromisoformat(r["created_at"]).strftime("%Y-%m-%d %H:%M") if r["created_at"] else ""
+            age_str = str(r["patient_age"]) if r["patient_age"] is not None else "N/A"
             data.append([
                 r["patient_name"],
+                age_str,
                 r["doctor_name"],
                 r["department"],
                 date_str,
@@ -293,11 +298,14 @@ class AdminService:
             elements.append(Paragraph("No department data available for chart.", styles['Normal']))
             elements.append(Spacer(1, 0.2 * inch))
 
-        data = [["Patient", "Doctor", "Department", "Date", "Status", "Condition"]]
+        # ✅ Added "Age" column
+        data = [["Patient", "Age", "Doctor", "Department", "Date", "Status", "Condition"]]
         for r in records:
             date_str = datetime.fromisoformat(r["created_at"]).strftime("%Y-%m-%d %H:%M") if r["created_at"] else ""
+            age_str = str(r["patient_age"]) if r["patient_age"] is not None else "N/A"
             data.append([
                 r["patient_name"],
+                age_str,
                 r["doctor_name"],
                 r["department"],
                 date_str,
@@ -328,7 +336,8 @@ class AdminService:
         ws = wb.active
         ws.title = "Consultations"
 
-        headers = ["Patient", "Doctor", "Department", "Date", "Status", "Condition"]
+        # ✅ Added "Age" column
+        headers = ["Patient", "Age", "Doctor", "Department", "Date", "Status", "Condition"]
         ws.append(headers)
 
         header_font = Font(bold=True, color="FFFFFF")
@@ -341,8 +350,10 @@ class AdminService:
 
         for r in records:
             date_str = datetime.fromisoformat(r["created_at"]).strftime("%Y-%m-%d %H:%M") if r["created_at"] else ""
+            age_str = str(r["patient_age"]) if r["patient_age"] is not None else "N/A"
             ws.append([
                 r["patient_name"],
+                age_str,
                 r["doctor_name"],
                 r["department"],
                 date_str,
@@ -422,18 +433,21 @@ class AdminService:
         elements.append(staff_table)
         elements.append(Spacer(1, 0.3 * inch))
 
-        # Patients table
+        # Patients table – with new columns
         elements.append(Paragraph("Patient List", styles['Heading2']))
-        patient_data = [["ID", "Name", "Phone", "Total Visits", "Last Visit"]]
+        patient_data = [["Patient No", "Name", "Age", "Gender", "Phone", "Status"]]
         for p in patients:
-            total_visits = getattr(p, 'total_visits', 0)
-            last_visit = getattr(p, 'last_visit', None)
+            pat_number = p.patient_number or f"PID-{p.id}"
+            age_display = str(p.age) if p.age is not None else "N/A"
+            gender_display = p.gender or "N/A"
+            status_display = p.status or "active"
             patient_data.append([
-                str(p.id),
+                pat_number,
                 p.name,
+                age_display,
+                gender_display,
                 p.phone or "",
-                str(total_visits),
-                last_visit.strftime("%Y-%m-%d") if last_visit else ""
+                status_display,
             ])
         patient_table = Table(patient_data)
         patient_table.setStyle(TableStyle([
@@ -470,19 +484,22 @@ class AdminService:
                 s.phone or ""
             ])
 
-        # Patients sheet
+        # Patients sheet – new columns
         ws_patients = wb.create_sheet("Patients")
-        patient_headers = ["ID", "Name", "Phone", "Total Visits", "Last Visit"]
+        patient_headers = ["Patient No", "Name", "Age", "Gender", "Phone", "Status"]
         ws_patients.append(patient_headers)
         for p in patients:
-            total_visits = getattr(p, 'total_visits', 0)
-            last_visit = getattr(p, 'last_visit', None)
+            pat_number = p.patient_number or f"PID-{p.id}"
+            age_display = str(p.age) if p.age is not None else "N/A"
+            gender_display = p.gender or "N/A"
+            status_display = p.status or "active"
             ws_patients.append([
-                p.id,
+                pat_number,
                 p.name,
+                age_display,
+                gender_display,
                 p.phone or "",
-                total_visits,
-                last_visit.strftime("%Y-%m-%d") if last_visit else ""
+                status_display,
             ])
 
         for ws in [ws_staff, ws_patients]:
@@ -615,18 +632,21 @@ class AdminService:
         elements.append(staff_table)
         elements.append(Spacer(1, 0.3 * inch))
 
-        # --- Patients Table ---
+        # --- Patients Table – with new columns ---
         elements.append(Paragraph("Patient List", styles['Heading2']))
-        patient_data = [["ID", "Name", "Phone", "Total Visits", "Last Visit"]]
+        patient_data = [["Patient No", "Name", "Age", "Gender", "Phone", "Status"]]
         for p in patients:
-            total_visits = getattr(p, 'total_visits', 0)
-            last_visit = getattr(p, 'last_visit', None)
+            pat_number = p.patient_number or f"PID-{p.id}"
+            age_display = str(p.age) if p.age is not None else "N/A"
+            gender_display = p.gender or "N/A"
+            status_display = p.status or "active"
             patient_data.append([
-                str(p.id),
+                pat_number,
                 p.name,
+                age_display,
+                gender_display,
                 p.phone or "",
-                str(total_visits),
-                last_visit.strftime("%Y-%m-%d") if last_visit else ""
+                status_display,
             ])
         patient_table = Table(patient_data)
         patient_table.setStyle(TableStyle([
