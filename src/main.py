@@ -275,15 +275,82 @@ async def get_doctor_profile(doctor_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Doctor not found")
     return {"success": True, "data": doctor}
 
+# ======================= UPDATED QUEUE ENDPOINTS =======================
 @app.get("/api/queue/current", tags=["queue"])
 async def get_current_consultation(doctor_id: str, db: Session = Depends(get_db)):
     result = QueueManager.get_current_patient(db, doctor_id)
-    return {"success": True, "data": result}
+    if result:
+        # Handle both dict and object responses
+        if isinstance(result, dict):
+            patient_id = result.get("patient_id")
+            data = {
+                "id": result.get("id"),
+                "consultation_number": result.get("consultation_number"),
+                "patient_id": patient_id,
+                "condition": result.get("condition"),
+                "priority": result.get("priority"),
+                "status": result.get("status"),
+                "created_at": result.get("created_at"),
+                "started_at": result.get("started_at"),
+                "completed_at": result.get("completed_at"),
+                "department": result.get("department"),
+                "doctor_id": result.get("doctor_id"),
+            }
+        else:
+            patient_id = result.patient_id
+            data = {
+                "id": result.id,
+                "consultation_number": result.consultation_number,
+                "patient_id": patient_id,
+                "condition": result.condition,
+                "priority": result.priority,
+                "status": result.status,
+                "created_at": result.created_at,
+                "started_at": result.started_at,
+                "completed_at": result.completed_at,
+                "department": result.department,
+                "doctor_id": result.doctor_id,
+            }
+        patient = db.query(Patient).filter(Patient.id == patient_id).first()
+        data["patient_name"] = patient.name if patient else None
+        return {"success": True, "data": data}
+    return {"success": True, "data": None}
 
 @app.get("/api/queue/waiting", tags=["queue"])
 async def get_waiting_patients_list(doctor_id: str, db: Session = Depends(get_db)):
-    patients = QueueManager.get_waiting_by_doctor(db, doctor_id)
-    return {"success": True, "data": patients}
+    consultations = QueueManager.get_waiting_by_doctor(db, doctor_id)
+    enriched = []
+    for cons in consultations:
+        if isinstance(cons, dict):
+            patient_id = cons.get("patient_id")
+            data = {
+                "id": cons.get("id"),
+                "consultation_number": cons.get("consultation_number"),
+                "patient_id": patient_id,
+                "condition": cons.get("condition"),
+                "priority": cons.get("priority"),
+                "status": cons.get("status"),
+                "created_at": cons.get("created_at"),
+                "department": cons.get("department"),
+                "doctor_id": cons.get("doctor_id"),
+            }
+        else:
+            patient_id = cons.patient_id
+            data = {
+                "id": cons.id,
+                "consultation_number": cons.consultation_number,
+                "patient_id": patient_id,
+                "condition": cons.condition,
+                "priority": cons.priority,
+                "status": cons.status,
+                "created_at": cons.created_at,
+                "department": cons.department,
+                "doctor_id": cons.doctor_id,
+            }
+        patient = db.query(Patient).filter(Patient.id == patient_id).first()
+        data["patient_name"] = patient.name if patient else None
+        enriched.append(data)
+    return {"success": True, "data": enriched}
 
 # =============================== QUEUE DISPLAY ENDPOINT ===============================
 @app.get("/api/queue/display", tags=["queue"])
@@ -526,8 +593,29 @@ async def call_next_patient(
 # --------------------------------------------------
 @app.get("/api/patients", tags=["patients"])
 async def list_patients(search: Optional[str] = None, db: Session = Depends(get_db)):
+    # Get base patient list (using PatientService.get_patients)
     patients = PatientService.get_patients(db, search=search)
-    return {"success": True, "data": patients, "count": len(patients)}
+
+    # Enrich each patient with gender and latest consultation condition
+    enriched = []
+    for p in patients:
+        # Get the most recent consultation for this patient
+        latest_consultation = (
+            db.query(Consultation)
+            .filter(Consultation.patient_id == p.id)
+            .order_by(desc(Consultation.created_at))
+            .first()
+        )
+        enriched.append({
+            "id": p.id,
+            "name": p.name,
+            "phone": p.phone,
+            "gender": p.gender,
+            "created_at": p.created_at,
+            "condition": latest_consultation.condition if latest_consultation else None,
+        })
+
+    return {"success": True, "data": enriched, "count": len(patients)}
 
 @app.post("/api/patients", tags=["patients"])
 async def create_patient(patient: PatientCreate, db: Session = Depends(get_db)):
@@ -803,6 +891,7 @@ async def get_receptionist_queue(db: Session = Depends(get_db)):
             {
                 "id": c.id,
                 "name": p.name,
+                "phone": p.phone,          # Added phone
                 "condition": c.condition,
                 "priority": c.priority,
                 "status": c.status,
@@ -828,12 +917,14 @@ async def quick_register_patient(data: QuickRegistration, db: Session = Depends(
         )
         db.add(new_patient)
         db.flush()
+        # Create consultation with a default doctor_id so it appears in the doctor's waiting list
         new_consultation = Consultation(
             patient_id=new_patient.id,
             condition=data.condition,
             priority=data.priority,
             department=data.department,
             status="waiting",
+            doctor_id="DOC001",          # <-- ADDED: assign to the default doctor
             consultation_number=f"C-{datetime.now().strftime('%y%m%d%H%M%S')}",
         )
         db.add(new_consultation)
