@@ -275,6 +275,114 @@ async def get_doctor_profile(doctor_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Doctor not found")
     return {"success": True, "data": doctor}
 
+@app.get("/api/doctors/{doctor_id}/stats", tags=["doctors"])
+async def get_doctor_stats(doctor_id: str, db: Session = Depends(get_db)):
+    """
+    Returns today's performance stats for a specific doctor.
+    Used by the doctor Statistics dashboard to show treated_today,
+    queue_cleared %, and avg consultation time.
+    """
+    today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+ 
+    # --- Treated today (status = "treated", completed today) ---
+    treated_today = (
+        db.query(Consultation)
+        .filter(
+            Consultation.doctor_id == doctor_id,
+            Consultation.status == "treated",
+            Consultation.completed_at >= today_start,
+        )
+        .count()
+    )
+ 
+    # --- Currently waiting for this doctor ---
+    waiting_count = (
+        db.query(Consultation)
+        .filter(
+            Consultation.doctor_id == doctor_id,
+            Consultation.status == "waiting",
+        )
+        .count()
+    )
+ 
+    # --- Queue cleared % ---
+    total_assigned_today = (
+        db.query(Consultation)
+        .filter(
+            Consultation.doctor_id == doctor_id,
+            Consultation.created_at >= today_start,
+        )
+        .count()
+    )
+    queue_cleared = (
+        round((treated_today / total_assigned_today) * 100)
+        if total_assigned_today > 0
+        else 0
+    )
+ 
+    # --- Avg consultation time in minutes ---
+    completed_with_times = (
+        db.query(Consultation)
+        .filter(
+            Consultation.doctor_id == doctor_id,
+            Consultation.status == "treated",
+            Consultation.started_at.isnot(None),
+            Consultation.completed_at.isnot(None),
+            Consultation.completed_at >= today_start,
+        )
+        .all()
+    )
+    if completed_with_times:
+        durations = [
+            (c.completed_at - c.started_at).seconds // 60
+            for c in completed_with_times
+            if c.completed_at > c.started_at
+        ]
+        avg_consult_minutes = round(sum(durations) / len(durations)) if durations else 14
+    else:
+        avg_consult_minutes = 14  # sensible default
+ 
+    # --- Weekly volume (last 7 days, Mon→Sun) ---
+    weekly_normal = []
+    weekly_emergency = []
+    for i in range(6, -1, -1):  # 6 days ago → today
+        day_start = today_start - timedelta(days=i)
+        day_end = day_start + timedelta(days=1)
+        normal = (
+            db.query(Consultation)
+            .filter(
+                Consultation.doctor_id == doctor_id,
+                Consultation.created_at >= day_start,
+                Consultation.created_at < day_end,
+                Consultation.priority <= 1,
+            )
+            .count()
+        )
+        emergency = (
+            db.query(Consultation)
+            .filter(
+                Consultation.doctor_id == doctor_id,
+                Consultation.created_at >= day_start,
+                Consultation.created_at < day_end,
+                Consultation.priority > 1,
+            )
+            .count()
+        )
+        weekly_normal.append(normal)
+        weekly_emergency.append(emergency)
+ 
+    return {
+        "success": True,
+        "data": {
+            "treated_today": treated_today,
+            "waiting_count": waiting_count,
+            "queue_cleared": queue_cleared,
+            "avg_consult_minutes": avg_consult_minutes,
+            "weekly_normal": weekly_normal,
+            "weekly_emergency": weekly_emergency,
+        },
+    }
+
 # ======================= UPDATED QUEUE ENDPOINTS =======================
 @app.get("/api/queue/current", tags=["queue"])
 async def get_current_consultation(doctor_id: str, db: Session = Depends(get_db)):
