@@ -1123,7 +1123,7 @@ async def suggest_medication(request: Request):
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": "claude-sonnet-4-20250514",
+                    "model": "claude-sonnet-5",
                     "max_tokens": 1000,
                     "messages": [
                         {
@@ -1156,8 +1156,9 @@ Return ONLY a raw JSON array, no markdown, no explanation, no extra text. Exampl
             return {"success": True, "suggestions": []}
 
         data = response.json()
-        raw = data.get("content", [{}])[0].get("text", "[]")
-        print(f"🤖 Raw AI response: {raw}")
+        text_blocks = [b["text"] for b in data.get("content", []) if b.get("type") == "text"]
+        raw = text_blocks[0] if text_blocks else "[]"
+        print(f"🤖 Raw AI response: {raw}") 
 
         clean = raw.replace("```json", "").replace("```", "").strip()
         suggestions = json.loads(clean)
